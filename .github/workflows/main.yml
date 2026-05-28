@@ -1,0 +1,260 @@
+# ================================================================
+#  Mi A2 (Jasmine) — Kernel CI/CD with Google Drive Upload
+#  LineageOS 18.1 · Snapdragon 660 · A-Only
+# ================================================================
+
+name: "🔨 Build Jasmine Kernel + Upload to GDrive"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Build Tier — Kaunsa tier build karna hai?"
+        required: true
+        default: "tier3"
+        type: choice
+        options:
+          - "tier1   (Low Risk — BBR+ZRAM+LMK+F2FS) SAFEST"
+          - "tier2   (Medium — Tier1 + Undervolt+SELinux+PWM)"
+          - "tier3   (FULL — Tier1+2 + Parallel Battery Safety) RECOMMENDED"
+          - "vanilla (Stock build — no tweaks)"
+      jobs:
+        description: "Parallel jobs (2=safe, 3=faster, 4=fastest)"
+        required: false
+        default: "2"
+        type: choice
+        options: ["2", "3", "4"]
+
+  push:
+    branches: [main, master]
+    paths-ignore: ["**.md", ".gitignore", "docs/**"]
+    tags: ["v*.*.*"]
+
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: jasmine-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "🏗️ Jasmine Kernel (${{ github.event.inputs.tier || 'tier3-auto' }})"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      BUILD_TIER: >-
+        ${{ github.event_name == 'pull_request' && 'tier1' ||
+        (github.event_name != 'workflow_dispatch' && 'tier3') ||
+        contains(github.event.inputs.tier || '', 'tier1') && 'tier1' ||
+        contains(github.event.inputs.tier || '', 'tier2') && 'tier2' ||
+        contains(github.event.inputs.tier || '', 'vanilla') && 'vanilla' ||
+        'tier3' }}
+      BUILD_JOBS: ${{ github.event.inputs.jobs || '2' }}
+      GDRIVE_FOLDER_ID: "1H28ejDbHH8c_sRBq7tL4YxI6oOUmFgBr"   # <-- aapki folder ID
+
+    steps:
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "💾 Free Disk Space"
+        run: |
+          echo "=== Disk BEFORE cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/lib/jvm /usr/local/.ghcup \
+            /usr/share/swift /opt/az "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo apt-get autoremove -y --purge snapd || true
+          sudo apt-get clean || true
+          echo "=== Disk AFTER cleanup ==="
+          df -h
+
+      - name: "📦 Install Build Dependencies"
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ make cmake \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf \
+            clang-12 lld-12 llvm-12 llvm-12-dev clang-tools-12 \
+            bc bison flex libssl-dev libelf-dev \
+            pahole dwarves \
+            git git-lfs curl wget \
+            zip unzip tar xz-utils lz4 zstd \
+            python3 python3-pip \
+            ccache device-tree-compiler cpio kmod rsync \
+            libncurses-dev gawk openssl
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm \
+                      llvm-objcopy llvm-objdump llvm-strip; do
+            which "$tool" 2>/dev/null && continue
+            which "${tool}-12" 2>/dev/null && \
+              sudo ln -sf "$(which ${tool}-12)" "/usr/local/bin/$tool" || true
+          done
+          echo "=== Clang version ==="
+          clang --version || clang-12 --version
+
+      - name: "⚙️ Cache Neutron/Proton Clang Toolchain"
+        uses: actions/cache@v4
+        id: cache-toolchain
+        with:
+          path: ~/Desktop/kernel/toolchain
+          key: tc-neutron-${{ runner.os }}-${{ hashFiles('jasmine_kernel_builder_v3.sh') }}
+          restore-keys: tc-neutron-${{ runner.os }}-
+
+      - name: "📂 Cache Kernel Source (LineageOS 18.1)"
+        uses: actions/cache@v4
+        id: cache-source
+        with:
+          path: ~/Desktop/kernel/source
+          key: src-los181-sdm660-${{ runner.os }}-${{ steps.date.outputs.week }}
+          restore-keys: src-los181-sdm660-${{ runner.os }}-
+
+      - name: "📅 Get Week Number"
+        id: date
+        run: echo "week=$(date +%Y-W%V)" >> $GITHUB_OUTPUT
+
+      - name: "⚡ Setup ccache"
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-jasmine-${{ env.BUILD_TIER }}-${{ github.sha }}
+          restore-keys: ccache-jasmine-${{ env.BUILD_TIER }}-
+
+      - name: "⚡ Configure ccache"
+        run: |
+          ccache --max-size=8G
+          ccache --set-config=compression=true
+          ccache -z
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: "🔨 Build Kernel — Tier: ${{ env.BUILD_TIER }}"
+        run: |
+          chmod +x jasmine_kernel_builder_v3.sh
+          bash jasmine_kernel_builder_v3.sh \
+            --ci "$BUILD_TIER" \
+            --jobs "$BUILD_JOBS"
+        env:
+          CCACHE_DIR: ${{ env.CCACHE_DIR || '~/.ccache' }}
+
+      - name: "🛡️ Hardware Safety Check (Battery/Thermal)"
+        run: |
+          echo "🔍 Verifying kernel config for safety features..."
+          CONFIG_PATH=$(find ~/Desktop/kernel/source -name ".config" | head -1)
+          if [[ -z "$CONFIG_PATH" ]]; then
+            echo "⚠️ Warning: .config not found, safety check skipped"
+            exit 0
+          fi
+          REQUIRED_CONFIGS=(
+            "CONFIG_BATTERY_QCOM=y"
+            "CONFIG_THERMAL=y"
+            "CONFIG_THERMAL_GOV_POWER_ALLOCATOR=y"
+            "CONFIG_REGULATOR=y"
+            "CONFIG_QCOM_BATT_THERM=y"
+          )
+          MISSING=()
+          for cfg in "${REQUIRED_CONFIGS[@]}"; do
+            key="${cfg%=*}"
+            expected="${cfg#*=}"
+            if grep -q "^$key=$expected" "$CONFIG_PATH"; then
+              echo "✅ $key=$expected"
+            else
+              echo "❌ MISSING: $key (expected $expected)"
+              MISSING+=("$key")
+            fi
+          done
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "::error::Hardware safety features missing: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "✅ All hardware safety configs present."
+
+      - name: "📊 ccache Statistics"
+        if: always()
+        run: ccache -s
+
+      - name: "🔍 Find Built ZIP"
+        id: find-zip
+        run: |
+          ZIP=$(find ~/Desktop/kernel/flashable -name "*.zip" 2>/dev/null | sort -r | head -1)
+          if [[ -z "$ZIP" ]]; then
+            echo "❌ ERROR: ZIP not found!"
+            exit 1
+          fi
+          echo "zip_path=$ZIP" >> $GITHUB_OUTPUT
+          echo "zip_name=$(basename "$ZIP")" >> $GITHUB_OUTPUT
+
+      # ── ARTIFACT UPLOAD (optional, for manual download) ──
+      - name: "📤 Upload Artifact (30-day download)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.find-zip.outputs.zip_name }}
+          path: ${{ steps.find-zip.outputs.zip_path }}
+          retention-days: 30
+
+      # ── 🚀 GOOGLE DRIVE UPLOAD ───────────────────────────
+      - name: "☁️ Upload ZIP to Google Drive"
+        if: success()   # sirf build success hone par
+        run: |
+          # rclone install
+          curl https://rclone.org/install.sh | sudo bash
+          
+          # service account JSON se rclone config banaye
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > /tmp/gdrive-sa.json
+          
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive.file
+          service_account_file = /tmp/gdrive-sa.json
+          team_drive = 
+          EOF
+          
+          # Upload karo
+          rclone copy "${{ steps.find-zip.outputs.zip_path }}" "gdrive:${GDRIVE_FOLDER_ID}" \
+            --drive-use-trash=false \
+            --progress \
+            --log-file=/tmp/rclone.log
+          
+          echo "✅ Upload ho gaya! Folder: https://drive.google.com/drive/folders/${GDRIVE_FOLDER_ID}"
+          
+          # Cleanup sensitive file
+          rm -f /tmp/gdrive-sa.json
+
+      # ── FAILURE LOGS ──
+      - name: "📋 Upload Build Logs (on Failure)"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "build-logs-FAILED-${{ github.run_id }}"
+          path: ~/Desktop/kernel/*.log
+
+      # ── GITHUB RELEASE (only on tag push) ──
+      - name: "🎉 Create GitHub Release"
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find-zip.outputs.zip_path }}
+          name: "Jasmine Kernel ${{ github.ref_name }} — LOS18.1"
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "📝 Build Summary"
+        if: always()
+        run: |
+          echo "## 🔨 Jasmine Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Device | Mi A2 (jasmine_sprout) — SDM660 |" >> $GITHUB_STEP_SUMMARY
+          echo "| ROM | LineageOS 18.1 A-Only |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Tier | \`$BUILD_TIER\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ZIP | ${{ steps.find-zip.outputs.zip_name || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Google Drive | [Open Folder](https://drive.google.com/drive/folders/$GDRIVE_FOLDER_ID) |" >> $GITHUB_STEP_SUMMARY
