@@ -1,0 +1,296 @@
+# ================================================================
+#  Mi A2 (Jasmine) — Kernel CI/CD Workflow
+#  LineageOS 18.1 · Snapdragon 660 · A-Only
+#  ── HOW TO USE (Chrome / GitHub Mobile) ──────────────────────
+#  1. Repo mein jaao → Actions tab
+#  2. "Build Jasmine Kernel" workflow click karo
+#  3. "Run workflow" → Tier select → Run
+#  4. Build complete hone par → zip download karo
+#  ── AUTO TRIGGER ─────────────────────────────────────────────
+#  main/master push par auto build hoga (Tier 3 = full safety)
+#  Tag "v*" push par GitHub Release bhi create hoga
+# ================================================================
+
+name: "🔨 Build Jasmine Kernel — Mi A2 LOS18.1"
+
+on:
+  # Manual trigger (GitHub mobile / Chrome ke liye best)
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Build Tier — Kaunsa tier build karna hai?"
+        required: true
+        default: "tier3"
+        type: choice
+        options:
+          - "tier1   (Low Risk — BBR+ZRAM+LMK+F2FS) SAFEST"
+          - "tier2   (Medium — Tier1 + Undervolt+SELinux+PWM)"
+          - "tier3   (FULL — Tier1+2 + Parallel Battery Safety) RECOMMENDED"
+          - "vanilla (Stock build — no tweaks)"
+      jobs:
+        description: "Parallel jobs (2=safe, 3=faster, 4=fastest)"
+        required: false
+        default: "2"
+        type: choice
+        options: ["2", "3", "4"]
+
+  # Main/master push par auto-build (tier3)
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - "docs/**"
+
+  # Tag push par Release bhi banta hai
+  push_tag:
+    tags:
+      - "v*.*.*"
+
+  # PR check (tier1 only for speed)
+  pull_request:
+    branches:
+      - main
+      - master
+
+# ── Permissions ──────────────────────────────────────────────────
+permissions:
+  contents: write    # Release create karne ke liye
+  actions: read
+
+# Ek waqt mein ek hi build run ho
+concurrency:
+  group: jasmine-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "🏗️ Jasmine Kernel (${{ github.event.inputs.tier || 'tier3-auto' }})"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180    # 3 hours max (full tier3 build)
+
+    env:
+      # Tier parse — input se ya auto (push = tier3, PR = tier1)
+      BUILD_TIER: >-
+        ${{
+          contains(github.event.inputs.tier, 'tier1') && 'tier1' ||
+          contains(github.event.inputs.tier, 'tier2') && 'tier2' ||
+          contains(github.event.inputs.tier, 'vanilla') && 'vanilla' ||
+          github.event_name == 'pull_request' && 'tier1' ||
+          'tier3'
+        }}
+      BUILD_JOBS: ${{ github.event.inputs.jobs || '2' }}
+
+    steps:
+      # ── STEP 1: Checkout repo ──────────────────────────────────
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1    # Shallow clone for speed
+
+      # ── STEP 2: Disk space free karo (CRITICAL) ───────────────
+      # GitHub runners mein sirf ~14GB free hota hai
+      # Kernel source + toolchain = 8-10GB chahiye
+      - name: "💾 Free Disk Space (Ubuntu Runner Cleanup)"
+        run: |
+          echo "=== Disk BEFORE cleanup ==="
+          df -h
+          # Android SDK, .NET, Haskell hata do (use nahi)
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/lib/jvm \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /opt/az \
+            "$AGENT_TOOLSDIRECTORY" \
+            2>/dev/null || true
+          sudo apt-get autoremove -y --purge snapd || true
+          sudo apt-get clean || true
+          echo "=== Disk AFTER cleanup ==="
+          df -h
+
+      # ── STEP 3: Dependencies install karo ─────────────────────
+      - name: "📦 Install Build Dependencies"
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ make cmake \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf \
+            clang-12 lld-12 llvm-12 llvm-12-dev clang-tools-12 \
+            bc bison flex libssl-dev libelf-dev \
+            pahole dwarves \
+            git git-lfs curl wget \
+            zip unzip tar xz-utils lz4 zstd \
+            python3 python3-pip \
+            ccache device-tree-compiler cpio kmod rsync \
+            libncurses-dev gawk openssl
+          # Clang symlinks (script ko bhi chahiye, runner ke liye extra safety)
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm \
+                      llvm-objcopy llvm-objdump llvm-strip; do
+            which "$tool" 2>/dev/null && continue
+            which "${tool}-12" 2>/dev/null && \
+              sudo ln -sf "$(which ${tool}-12)" "/usr/local/bin/$tool" || true
+          done
+          echo "=== Clang version ==="
+          clang --version || clang-12 --version
+
+      # ── STEP 4: Toolchain cache (baar baar download na ho) ────
+      - name: "⚙️ Cache Neutron/Proton Clang Toolchain"
+        uses: actions/cache@v4
+        id: cache-toolchain
+        with:
+          path: ~/Desktop/kernel/toolchain
+          # Script hash se cache key — script badli to naya download
+          key: tc-neutron-${{ runner.os }}-${{ hashFiles('jasmine_kernel_builder_v3.sh') }}
+          restore-keys: |
+            tc-neutron-${{ runner.os }}-
+
+      # ── STEP 5: Kernel source cache ───────────────────────────
+      # Source ~1.5GB hai — cache se ~10 min bachta hai
+      - name: "📂 Cache Kernel Source (LineageOS 18.1)"
+        uses: actions/cache@v4
+        id: cache-source
+        with:
+          path: ~/Desktop/kernel/source
+          # Weekly cache refresh (source updates ho sakti hai)
+          key: src-los181-sdm660-${{ runner.os }}-${{ steps.date.outputs.week }}
+          restore-keys: |
+            src-los181-sdm660-${{ runner.os }}-
+
+      # Week number for cache key
+      - name: "📅 Get Week Number"
+        id: date
+        run: echo "week=$(date +%Y-W%V)" >> $GITHUB_OUTPUT
+
+      # ── STEP 6: ccache setup ──────────────────────────────────
+      - name: "⚡ Setup ccache (Faster Rebuilds)"
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-jasmine-${{ env.BUILD_TIER }}-${{ github.sha }}
+          restore-keys: |
+            ccache-jasmine-${{ env.BUILD_TIER }}-
+            ccache-jasmine-
+
+      - name: "⚡ Configure ccache"
+        run: |
+          ccache --max-size=8G
+          ccache --set-config=compression=true
+          ccache -z
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      # ── STEP 7: Kernel build! ──────────────────────────────────
+      - name: "🔨 Build Kernel — Tier: ${{ env.BUILD_TIER }}"
+        run: |
+          chmod +x jasmine_kernel_builder_v3.sh
+          bash jasmine_kernel_builder_v3.sh \
+            --ci "$BUILD_TIER" \
+            --jobs "$BUILD_JOBS"
+        env:
+          CCACHE_DIR: ${{ env.CCACHE_DIR || '~/.ccache' }}
+
+      # ── STEP 8: ccache stats (debug ke liye) ──────────────────
+      - name: "📊 ccache Statistics"
+        if: always()
+        run: ccache -s
+
+      # ── STEP 9: Find the built ZIP ────────────────────────────
+      - name: "🔍 Find Built ZIP"
+        id: find-zip
+        run: |
+          ZIP=$(find ~/Desktop/kernel/flashable -name "*.zip" 2>/dev/null | sort -r | head -1)
+          if [[ -z "$ZIP" ]]; then
+            echo "❌ ERROR: Koi ZIP nahi mili! Build fail ho gaya hoga."
+            ls -la ~/Desktop/kernel/flashable/ 2>/dev/null || echo "Directory nahi hai"
+            exit 1
+          fi
+          ZIP_NAME=$(basename "$ZIP")
+          ZIP_SIZE=$(du -sh "$ZIP" | cut -f1)
+          echo "zip_path=$ZIP"         >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME"    >> $GITHUB_OUTPUT
+          echo "zip_size=$ZIP_SIZE"    >> $GITHUB_OUTPUT
+          echo "✅ ZIP ready: $ZIP_NAME ($ZIP_SIZE)"
+
+      # ── STEP 10: Upload ZIP as Artifact ───────────────────────
+      # Chrome / GitHub Mobile mein Actions → Run → Artifacts se download
+      - name: "📤 Upload Flashable ZIP (30-day download)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.find-zip.outputs.zip_name }}
+          path: ${{ steps.find-zip.outputs.zip_path }}
+          retention-days: 30
+          compression-level: 0    # ZIP already compressed hai
+
+      # ── STEP 11: Logs upload (failure par) ───────────────────
+      - name: "📋 Upload Build Logs (on Failure)"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "build-logs-FAILED-${{ github.run_id }}"
+          path: |
+            ~/Desktop/kernel/build.log
+            ~/Desktop/kernel/tweaks.log
+            ~/Desktop/kernel/fixes.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── STEP 12: Create GitHub Release (tag push par) ─────────
+      - name: "🎉 Create GitHub Release"
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find-zip.outputs.zip_path }}
+          name: "Jasmine Kernel ${{ github.ref_name }} — LOS18.1"
+          generate_release_notes: true
+          body: |
+            ## 📱 Mi A2 (Jasmine) Kernel — ${{ github.ref_name }}
+
+            | Info | Value |
+            |------|-------|
+            | Device | Mi A2 (jasmine_sprout) |
+            | SoC | Snapdragon 660 (SDM660) |
+            | ROM | LineageOS 18.1 (Android 11) |
+            | Slot | A-Only (Slot-B ignored) |
+            | Build Tier | ${{ env.BUILD_TIER }} |
+            | ZIP Size | ${{ steps.find-zip.outputs.zip_size }} |
+
+            ### ⚡ How to Flash
+            1. ZIP ko phone ke internal storage mein copy karo
+            2. TWRP recovery mein boot karo
+            3. ZIP flash karo — **data wipe mat karo**
+            4. Reboot → Init.d tweaks first boot pe (~30s) apply honge
+
+            ### 🔋 Battery Safety Check (Tier 3)
+            ```
+            cat /sys/class/power_supply/battery/voltage_max     # → 4400000
+            cat /sys/class/power_supply/usb/current_max         # → 3000000
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── STEP 13: Build Summary ─────────────────────────────────
+      - name: "📝 Build Summary"
+        if: always()
+        run: |
+          echo "## 🔨 Jasmine Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Device | Mi A2 (jasmine_sprout) — SDM660 |" >> $GITHUB_STEP_SUMMARY
+          echo "| ROM | LineageOS 18.1 A-Only |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Tier | \`$BUILD_TIER\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Jobs | $BUILD_JOBS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runner OS | ${{ runner.os }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ZIP | ${{ steps.find-zip.outputs.zip_name || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ZIP Size | ${{ steps.find-zip.outputs.zip_size || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⬇️ Download" >> $GITHUB_STEP_SUMMARY
+          echo "Actions page → This run → **Artifacts section** mein ZIP milegi" >> $GITHUB_STEP_SUMMARY
