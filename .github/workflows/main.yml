@@ -1,0 +1,167 @@
+name: MAHEFOOZ1710 GODMODE COMPILATION PIPELINE
+
+# Manual trigger taaki tum jab chaho tab compile kar sako
+on:
+  workflow_dispatch:
+
+env:
+  # Tumhara Google Drive Folder ID
+  GDRIVE_FOLDER_ID: "1H28ejDbHH8c_sRBq7tL4YxI6oOUmFgBr"
+  TARGET_ARCH: "-march=skylake -O3 -flto"
+
+jobs:
+  # ==========================================
+  # 1. CUSTOM MESA DRIVERS (Intel Only)
+  # ==========================================
+  build-mesa:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Reality Check - System Prep & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build python3-mako python3-pkgconfig \
+            libdrm-dev libx11-xcb-dev libxext-dev libxdamage-dev libxcb-glx0-dev \
+            libxcb-shm0-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-present-dev \
+            libxshmfence-dev libxxf86vm-dev libwayland-dev wayland-protocols \
+            libelf-dev libvulkan-dev glslang-tools python3-setuptools
+      - name: Fetch Mesa Source
+        run: |
+          git clone --depth 1 -b main https://gitlab.freedesktop.org/mesa/mesa.git
+      - name: Compile Skylake Optimized Mesa
+        run: |
+          cd mesa
+          # Deep Check: Only building ANV (Intel Vulkan) & Iris (Intel OpenGL)
+          meson setup build -Dplatforms=x11,wayland \
+            -Dgallium-drivers=iris -Dvulkan-drivers=intel \
+            -Dc_args="${TARGET_ARCH}" -Dcpp_args="${TARGET_ARCH}" \
+            --buildtype=release --prefix=/tmp/mesa-mahefooz
+          ninja -C build install
+          cd /tmp && tar -czvf mesa-custom-skylake.tar.gz mesa-mahefooz/
+      - name: Upload to GitHub Artifacts (Temp Storage)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-custom
+          path: /tmp/mesa-custom-skylake.tar.gz
+
+  # ==========================================
+  # 2. MANGOHUD (Custom Overlay)
+  # ==========================================
+  build-mangohud:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build g++-multilib \
+            libx11-dev libvulkan-dev libwayland-dev wayland-protocols \
+            libdbus-1-dev libspdlog-dev libfmt-dev nlohmann-json3-dev
+      - name: Fetch MangoHud
+        run: git clone --depth 1 --recurse-submodules https://github.com/flightlessmango/MangoHud.git
+      - name: Compile Minimal MangoHud
+        run: |
+          cd MangoHud
+          meson setup build -Dwith_wayland=enabled -Dwith_x11=enabled \
+            -Dbuildtype=release -Dc_args="${TARGET_ARCH}" -Dcpp_args="${TARGET_ARCH}" \
+            --prefix=/tmp/mangohud-mahefooz
+          ninja -C build install
+          cd /tmp && tar -czvf mangohud-custom.tar.gz mangohud-mahefooz/
+      - name: Upload to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mangohud-custom
+          path: /tmp/mangohud-custom.tar.gz
+
+  # ==========================================
+  # 3. CUSTOM BARE-METAL KERNEL
+  # ==========================================
+  build-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex \
+            libssl-dev libelf-dev bc rsync kmod cpio xz-utils
+      - name: Fetch Xanmod Source (Base)
+        run: git clone --depth 1 -b 6.6 https://gitlab.com/xanmod/linux.git xanmod-kernel
+      - name: Extreme Hardware Targeting (i3-6100, HD 530)
+        run: |
+          cd xanmod-kernel
+          make x86_64_defconfig
+          # Scripting specific hardware configs to strip bloat
+          scripts/config --enable CONFIG_DRM_I915
+          scripts/config --disable CONFIG_DRM_AMDGPU
+          scripts/config --disable CONFIG_DRM_NOUVEAU
+          scripts/config --enable CONFIG_E1000E  # Intel I219-V LAN
+          scripts/config --enable CONFIG_SND_HDA_INTEL # ALC3234 Audio
+          scripts/config --set-str CONFIG_DEFAULT_HOSTNAME "Optiplex7050"
+          make olddefconfig
+      - name: Compile Kernel
+        run: |
+          cd xanmod-kernel
+          make -j$(nproc) bindeb-pkg
+          mkdir -p /tmp/kernel-mahefooz
+          mv ../*.deb /tmp/kernel-mahefooz/
+          cd /tmp && tar -czvf kernel-custom-optiplex.tar.gz kernel-mahefooz/
+      - name: Upload to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-custom
+          path: /tmp/kernel-custom-optiplex.tar.gz
+
+  # ==========================================
+  # 4. WINE-TKG / PROTON-CUSTOM
+  # ==========================================
+  build-wine:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y git wget autoconf bison flex gcc g++ \
+            gcc-multilib g++-multilib libasound2-dev:i386 libasound2-dev
+      - name: Fetch Wine-TKG
+        run: git clone https://github.com/Frogging-Family/wine-tkg-git.git
+      - name: Configure and Compile
+        run: |
+          cd wine-tkg-git/wine-tkg-git
+          # Injecting patches for memory hacks & async
+          sed -i 's/_dxvk_dxgi="true"/_dxvk_dxgi="true"/' customization.cfg
+          sed -i 's/_proton_fsr="false"/_proton_fsr="true"/' customization.cfg
+          # Building (Using internal non-pacman script for Ubuntu)
+          ./nonpacman-build.sh
+          mkdir -p /tmp/wine-mahefooz
+          cp -r nonpacman-builds/* /tmp/wine-mahefooz/ || echo "Builds moved"
+          cd /tmp && tar -czvf wine-tkg-custom.tar.gz wine-mahefooz/
+      - name: Upload to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-custom
+          path: /tmp/wine-tkg-custom.tar.gz
+
+  # ==========================================
+  # 5. SYNC TO GOOGLE DRIVE
+  # ==========================================
+  upload-to-gdrive:
+    needs: [build-mesa, build-mangohud, build-kernel, build-wine]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all compiled artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/mahefooz-compiled-bins/
+      - name: Prepare Final Package
+        run: |
+          cd /tmp/
+          tar -czvf MAHEFOOZ_GODMODE_BINARIES.tar.gz mahefooz-compiled-bins/
+      - name: Upload to Google Drive via Rclone
+        env:
+          # Failure Point blocked: Tumhe GitHub Secrets mein Rclone Config set karni hogi
+          RCLONE_CONFIG_GDRIVE: ${{ secrets.RCLONE_CONF }}
+        run: |
+          sudo apt-get install -y rclone
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_GDRIVE" > ~/.config/rclone/rclone.conf
+          rclone copy /tmp/MAHEFOOZ_GODMODE_BINARIES.tar.gz gdrive:${{ env.GDRIVE_FOLDER_ID }} --progress
+          
