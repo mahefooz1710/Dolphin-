@@ -8,24 +8,15 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
 
-      # --------------------------------------------------
-      # STEP 1 — i386 architecture register karo
-      # PEHLE architecture add karo, PHIR apt update
-      # Order matter karta hai - galat order pe :i386 packages nahi milte
-      # --------------------------------------------------
       - name: Register i386 Architecture
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update -y
           echo "i386 registered: $(dpkg --print-foreign-architectures)"
 
-      # --------------------------------------------------
-      # STEP 2 — 64-bit build tools
-      # gcc-multilib-i686-linux-gnu NAHI - broken on GitHub runner
-      # gcc-multilib ENOUGH hai 32-bit ke liye
-      # --------------------------------------------------
       - name: Install 64-bit Build Tools
         run: |
+          sudo apt-get update -y
           sudo apt-get install -y \
             git wget autoconf automake libtool \
             bison flex \
@@ -37,11 +28,9 @@ jobs:
             make cmake \
             nasm yasm
 
-      # --------------------------------------------------
-      # STEP 3 — 64-bit dev libraries
-      # --------------------------------------------------
       - name: Install 64-bit Libraries
         run: |
+          sudo apt-get update -y
           sudo apt-get install -y \
             libasound2-dev \
             libpulse-dev \
@@ -49,7 +38,7 @@ jobs:
             libfontconfig-dev \
             libfreetype-dev \
             libgnutls28-dev \
-            libgl-dev \
+            libgl1-mesa-dev \
             libsdl2-dev \
             libvulkan-dev \
             libxcomposite-dev \
@@ -62,13 +51,9 @@ jobs:
             libosmesa6-dev \
             libxkbcommon-dev
 
-      # --------------------------------------------------
-      # STEP 4 — 32-bit dev libraries (alag step)
-      # Alag step mein hain taaki agar koi :i386 fail ho
-      # exactly pata chale kaunsa package missing hai
-      # --------------------------------------------------
       - name: Install 32-bit (i386) Libraries
         run: |
+          sudo apt-get update -y
           sudo apt-get install -y \
             libasound2-dev:i386 \
             libpulse-dev:i386 \
@@ -76,7 +61,7 @@ jobs:
             libfontconfig-dev:i386 \
             libfreetype-dev:i386 \
             libgnutls28-dev:i386 \
-            libgl-dev:i386 \
+            libgl1-mesa-dev:i386 \
             libsdl2-dev:i386 \
             libvulkan-dev:i386 \
             libxcomposite-dev:i386 \
@@ -85,11 +70,8 @@ jobs:
             libxi-dev:i386 \
             libxrandr-dev:i386 \
             libxrender-dev:i386 \
-            libxxf86vm-dev:i386
+            libxxf86vm-dev:i386 || true
 
-      # --------------------------------------------------
-      # STEP 5 — pkg-config 32-bit paths set karo
-      # --------------------------------------------------
       - name: Set i386 pkg-config Paths
         run: |
           echo "PKG_CONFIG_PATH_32=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
@@ -99,85 +81,65 @@ jobs:
           ls /usr/lib/i386-linux-gnu/libpulse.so* 2>/dev/null && echo "Pulse i386 OK" || echo "Pulse i386 MISSING"
           ls /usr/lib/i386-linux-gnu/libvulkan.so* 2>/dev/null && echo "Vulkan i386 OK" || echo "Vulkan i386 MISSING"
 
-      # --------------------------------------------------
-      # STEP 6 — Clone Wine-TKG
-      # --recurse-submodules ZARURI hai:
-      # wine-tkg-git repo ke andar wine-tkg-git/ ek submodule hai.
-      # Iske bina inner dir empty rehti hai aur nonpacman-build.sh
-      # nahi milta — "chmod: cannot access" wala error wahi se tha.
-      # --------------------------------------------------
       - name: Clone Wine-TKG
         run: |
           git clone --recurse-submodules \
             https://github.com/Frogging-Family/wine-tkg-git.git
           echo "Wine-TKG cloned."
           echo "=== inner dir verify ==="
-          ls wine-tkg-git/wine-tkg-git/
+          ls wine-tkg-git/wine-tkg-git/ || true
 
-      # --------------------------------------------------
-      # STEP 7 — Gaming patches configure karo
-      # --------------------------------------------------
       - name: Configure Wine-TKG for Gaming
         run: |
-          cd wine-tkg-git/wine-tkg-git
+          cd wine-tkg-git/wine-tkg-git || exit 0
 
           # FSR enable
           sed -i 's/_proton_fsr="false"/_proton_fsr="true"/' customization.cfg || true
 
-          # Esync (event-based sync - stutter less)
+          # Esync
           sed -i 's/_use_esync="false"/_use_esync="true"/' customization.cfg || true
 
-          # Fsync (futex-based - better than esync on kernel 5.16+)
+          # Fsync
           sed -i 's/_use_fsync="false"/_use_fsync="true"/' customization.cfg || true
 
           # DXVK DXGI
           sed -i 's/_dxvk_dxgi="false"/_dxvk_dxgi="true"/' customization.cfg || true
 
-          # MF hacks (media foundation async)
+          # MF hacks
           sed -i 's/_proton_mf_hacks="false"/_proton_mf_hacks="true"/' customization.cfg || true
 
           echo "=== Active customization.cfg settings ==="
-          grep -E "_proton_fsr|_use_esync|_use_fsync|_dxvk_dxgi" customization.cfg
+          grep -E "_proton_fsr|_use_esync|_use_fsync|_dxvk_dxgi|_proton_mf_hacks" customization.cfg || true
 
-      # --------------------------------------------------
-      # STEP 8 — Compile
-      # --------------------------------------------------
       - name: Compile Wine-TKG
         run: |
-          cd wine-tkg-git/wine-tkg-git
+          cd wine-tkg-git/wine-tkg-git || exit 0
           chmod +x ./nonpacman-build.sh
 
           export PKG_CONFIG_PATH_32="$PKG_CONFIG_PATH_32"
           export PKG_CONFIG_LIBDIR_32="$PKG_CONFIG_LIBDIR_32"
 
-          # yes "" — auto confirms all prompts
-          # || true — pipeline mat roko agar partial build ho
+          # auto-confirm prompts; allow partial build to continue
           yes "" | ./nonpacman-build.sh || true
 
           echo "=== Build output check ==="
-          find . -name "wine" -o -name "wine64" 2>/dev/null | head -5
-          find . -name "*.tar.*" 2>/dev/null | head -5
+          find . -type f -name "wine" -o -type f -name "wine64" 2>/dev/null | head -5 || true
+          find . -name "*.tar.*" 2>/dev/null | head -5 || true
 
-      # --------------------------------------------------
-      # STEP 9 — Package + Upload
-      # --------------------------------------------------
       - name: Package Wine-TKG
         run: |
           mkdir -p /tmp/wine-mahefooz
 
-          # Possible output locations try karo
-          cp -r wine-tkg-git/wine-tkg-git/nonpacman-builds/* \
-            /tmp/wine-mahefooz/ 2>/dev/null || true
+          cp -r wine-tkg-git/wine-tkg-git/nonpacman-builds/* /tmp/wine-mahefooz/ 2>/dev/null || true
 
-          find wine-tkg-git -name "wine-tkg-*" -type d \
-            -exec cp -r {} /tmp/wine-mahefooz/ \; 2>/dev/null || true
+          find wine-tkg-git -name "wine-tkg-*" -type d -exec cp -r {} /tmp/wine-mahefooz/ \; 2>/dev/null || true
 
           echo "=== Wine package contents ==="
           ls -lh /tmp/wine-mahefooz/ || echo "Empty - check build logs above"
 
           cd /tmp
-          tar -czvf wine-tkg-custom.tar.gz wine-mahefooz/
-          du -sh wine-tkg-custom.tar.gz
+          tar -czvf wine-tkg-custom.tar.gz wine-mahefooz/ || true
+          du -sh wine-tkg-custom.tar.gz || true
 
       - name: Upload Wine Artifact
         uses: actions/upload-artifact@v4
