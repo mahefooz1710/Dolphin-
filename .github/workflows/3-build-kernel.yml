@@ -1,0 +1,137 @@
+name: "03 | BUILD KERNEL (Xanmod 6.6 / OptiPlex 7050)"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+
+      # --------------------------------------------------
+      # STEP 1 — Build tools
+      # --------------------------------------------------
+      - name: Install Kernel Build Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            libncurses-dev \
+            bison flex \
+            libssl-dev libelf-dev \
+            bc rsync kmod cpio \
+            xz-utils dwarves pahole \
+            debhelper dpkg-dev \
+            gcc make binutils
+
+      # --------------------------------------------------
+      # STEP 2 — Clone Xanmod 6.6 kernel
+      # Fallback chain: specific tag → latest xanmod 6.6 branch
+      # --------------------------------------------------
+      - name: Clone Xanmod Kernel 6.6
+        run: |
+          # Try 1: specific stable tag
+          git clone --depth 1 \
+            -b 6.6.30-xanmod1 \
+            https://github.com/xanmod/linux.git xanmod-kernel \
+          || \
+          # Try 2: main 6.6 branch (agar tag nahi mila)
+          git clone --depth 1 \
+            -b 6.6 \
+            https://github.com/xanmod/linux.git xanmod-kernel \
+          || \
+          # Try 3: vanilla latest (last resort)
+          git clone --depth 1 \
+            https://github.com/xanmod/linux.git xanmod-kernel
+
+          cd xanmod-kernel
+          echo "Kernel version: $(make kernelversion 2>/dev/null || cat Makefile | head -5)"
+
+      # --------------------------------------------------
+      # STEP 3 — Hardware-specific config
+      # i3-6100 (Skylake) + Intel HD 530 + OptiPlex 7050
+      # --------------------------------------------------
+      - name: Configure Kernel for i3-6100 + HD 530
+        run: |
+          cd xanmod-kernel
+          make x86_64_defconfig
+
+          # === GPU: Intel HD 530 (Skylake GT2) ONLY ===
+          scripts/config --enable  CONFIG_DRM_I915
+          scripts/config --disable CONFIG_DRM_AMDGPU
+          scripts/config --disable CONFIG_DRM_RADEON
+          scripts/config --disable CONFIG_DRM_NOUVEAU
+          scripts/config --disable CONFIG_DRM_VMWGFX
+
+          # === Network: Intel I219-LM (OptiPlex 7050) ===
+          scripts/config --enable CONFIG_E1000E
+          scripts/config --enable CONFIG_IGB
+
+          # === Audio: Intel HDA + Realtek ALC3234 ===
+          scripts/config --enable CONFIG_SND_HDA_INTEL
+          scripts/config --enable CONFIG_SND_HDA_CODEC_REALTEK
+          scripts/config --enable CONFIG_SND_HDA_CODEC_HDMI
+
+          # === USB + HID: Cosmic Byte Stelleris Controller ===
+          scripts/config --enable CONFIG_USB_XHCI_HCD
+          scripts/config --enable CONFIG_HID
+          scripts/config --enable CONFIG_HID_GENERIC
+          scripts/config --enable CONFIG_USB_HID
+          scripts/config --enable CONFIG_INPUT_JOYDEV
+
+          # === CPU Performance: i3-6100 (no turbo, fixed 3.7GHz) ===
+          scripts/config --enable CONFIG_CPU_FREQ_GOV_PERFORMANCE
+          scripts/config --enable CONFIG_INTEL_IDLE
+          scripts/config --enable CONFIG_X86_INTEL_PSTATE
+
+          # === RAM: 8GB optimized ===
+          scripts/config --set-val CONFIG_NR_CPUS 4
+          scripts/config --enable  CONFIG_TRANSPARENT_HUGEPAGE
+
+          # === Strip unused hardware ===
+          scripts/config --disable CONFIG_PCCARD
+          scripts/config --disable CONFIG_CARDBUS
+          scripts/config --disable CONFIG_FIREWIRE
+          scripts/config --disable CONFIG_THUNDERBOLT
+          scripts/config --disable CONFIG_INFINIBAND
+          scripts/config --disable CONFIG_BT
+          scripts/config --disable CONFIG_WLAN
+
+          # === Hostname ===
+          scripts/config --set-str CONFIG_DEFAULT_HOSTNAME "Optiplex7050"
+
+          make olddefconfig
+          echo "=== Final config summary ==="
+          grep -E "CONFIG_DRM_I915|CONFIG_E1000E|CONFIG_SND_HDA" .config
+
+      # --------------------------------------------------
+      # STEP 4 — Compile (deb packages)
+      # --------------------------------------------------
+      - name: Compile Kernel (bindeb-pkg)
+        run: |
+          cd xanmod-kernel
+          make -j$(nproc) bindeb-pkg \
+            LOCALVERSION="-mahefooz-optiplex" \
+            KDEB_PKGVERSION="1.0-mahefooz"
+          echo "=== .deb files ==="
+          ls -lh ../*.deb
+
+      # --------------------------------------------------
+      # STEP 5 — Package + Upload
+      # --------------------------------------------------
+      - name: Package Kernel
+        run: |
+          mkdir -p /tmp/kernel-mahefooz
+          mv ../*.deb /tmp/kernel-mahefooz/ 2>/dev/null || \
+            find /home/runner/work -name "*.deb" -exec mv {} /tmp/kernel-mahefooz/ \;
+          echo "=== .deb contents ==="
+          ls -lh /tmp/kernel-mahefooz/
+          cd /tmp
+          tar -czvf kernel-custom-optiplex.tar.gz kernel-mahefooz/
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-custom-optiplex
+          path: /tmp/kernel-custom-optiplex.tar.gz
+          retention-days: 3

@@ -1,0 +1,100 @@
+name: "02 | BUILD MANGOHUD (Gaming Overlay)"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-mangohud:
+    runs-on: ubuntu-22.04
+    steps:
+
+      # --------------------------------------------------
+      # STEP 1 — APT dependencies
+      # xkbcommon explicitly add kiya (screenshot error fix)
+      # --------------------------------------------------
+      - name: Install APT Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            meson ninja-build \
+            g++ g++-multilib gcc-multilib \
+            libx11-dev \
+            libvulkan-dev \
+            libwayland-dev wayland-protocols \
+            libdbus-1-dev \
+            python3-mako \
+            libdrm-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxnvctrl-dev \
+            libgl-dev \
+            cmake pkg-config
+
+      # --------------------------------------------------
+      # STEP 2 — Clone MangoHud v0.7.2 stable
+      # --------------------------------------------------
+      - name: Clone MangoHud v0.7.2
+        run: |
+          git clone --depth 1 \
+            --recurse-submodules \
+            -b v0.7.2 \
+            https://github.com/flightlessmango/MangoHud.git
+          echo "MangoHud clone done."
+
+      # --------------------------------------------------
+      # STEP 3 — Configure
+      # use_system_spdlog=disabled: bundled version use karo
+      # system wala Ubuntu 22.04 pe version mismatch karta hai
+      # --------------------------------------------------
+      - name: Configure MangoHud (meson setup)
+        run: |
+          # pipefail: pipe ke andar koi bhi command fail ho toh step fail ho
+          # Iske bina "meson setup | tee" mein tee ka exit code capture hota
+          # tha (hamesha 0), meson ka nahi — isliye step green dikhta tha
+          # aur build.ninja create nahi hota tha.
+          set -o pipefail
+          cd MangoHud
+          SKYLAKE_FLAGS="-march=skylake -O2 -pipe"
+
+          meson setup build \
+            -Dwith_wayland=enabled \
+            -Dwith_x11=enabled \
+            -Duse_system_spdlog=disabled \
+            -Dbuildtype=release \
+            -Dc_args="${SKYLAKE_FLAGS}" \
+            -Dcpp_args="${SKYLAKE_FLAGS}" \
+            --prefix=/tmp/mangohud-mahefooz \
+            2>&1 | tee /tmp/mangohud-setup.log
+
+          tail -20 /tmp/mangohud-setup.log
+
+      # --------------------------------------------------
+      # STEP 4 — Compile + Install
+      # --------------------------------------------------
+      - name: Compile MangoHud
+        run: |
+          cd MangoHud
+          ninja -C build -j2
+
+      - name: Install MangoHud
+        run: |
+          cd MangoHud
+          ninja -C build install
+          echo "=== Installed ==="
+          find /tmp/mangohud-mahefooz -type f | head -20
+
+      # --------------------------------------------------
+      # STEP 5 — Package + Upload
+      # --------------------------------------------------
+      - name: Package MangoHud
+        run: |
+          cd /tmp
+          tar -czvf mangohud-custom.tar.gz mangohud-mahefooz/
+          du -sh mangohud-custom.tar.gz
+
+      - name: Upload MangoHud Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mangohud-custom
+          path: /tmp/mangohud-custom.tar.gz
+          retention-days: 3
