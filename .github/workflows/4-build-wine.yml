@@ -8,12 +8,28 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
 
+      # --------------------------------------------------
+      # STEP 0 — Checkout (optional, but useful if you want to use actions/checkout)
+      # --------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # --------------------------------------------------
+      # STEP 1 — i386 architecture register karo
+      # PEHLE architecture add karo, PHIR apt update
+      # Order matter karta hai - galat order pe :i386 packages nahi milte
+      # --------------------------------------------------
       - name: Register i386 Architecture
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update -y
           echo "i386 registered: $(dpkg --print-foreign-architectures)"
 
+      # --------------------------------------------------
+      # STEP 2 — 64-bit build tools
+      # --------------------------------------------------
       - name: Install 64-bit Build Tools
         run: |
           sudo apt-get update -y
@@ -28,6 +44,9 @@ jobs:
             make cmake \
             nasm yasm
 
+      # --------------------------------------------------
+      # STEP 3 — 64-bit dev libraries
+      # --------------------------------------------------
       - name: Install 64-bit Libraries
         run: |
           sudo apt-get update -y
@@ -51,6 +70,11 @@ jobs:
             libosmesa6-dev \
             libxkbcommon-dev
 
+      # --------------------------------------------------
+      # STEP 4 — 32-bit dev libraries (alag step)
+      # Alag step mein hain taaki agar koi :i386 fail ho
+      # exactly pata chale kaunsa package missing hai
+      # --------------------------------------------------
       - name: Install 32-bit (i386) Libraries
         run: |
           sudo apt-get update -y
@@ -72,6 +96,9 @@ jobs:
             libxrender-dev:i386 \
             libxxf86vm-dev:i386 || true
 
+      # --------------------------------------------------
+      # STEP 5 — pkg-config 32-bit paths set karo
+      # --------------------------------------------------
       - name: Set i386 pkg-config Paths
         run: |
           echo "PKG_CONFIG_PATH_32=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
@@ -81,17 +108,36 @@ jobs:
           ls /usr/lib/i386-linux-gnu/libpulse.so* 2>/dev/null && echo "Pulse i386 OK" || echo "Pulse i386 MISSING"
           ls /usr/lib/i386-linux-gnu/libvulkan.so* 2>/dev/null && echo "Vulkan i386 OK" || echo "Vulkan i386 MISSING"
 
-      - name: Clone Wine-TKG
+      # --------------------------------------------------
+      # STEP 6 — Clone Wine-TKG (with submodules)
+      # Use git clone so you always get the latest upstream repo
+      # --------------------------------------------------
+      - name: Clone Wine-TKG (with submodules)
         run: |
-          git clone --recurse-submodules \
-            https://github.com/Frogging-Family/wine-tkg-git.git
-          echo "Wine-TKG cloned."
-          echo "=== inner dir verify ==="
-          ls wine-tkg-git/wine-tkg-git/ || true
+          git clone --recurse-submodules https://github.com/Frogging-Family/wine-tkg-git.git
+          cd wine-tkg-git || exit 0
+          git submodule update --init --recursive || true
+          echo "=== Repo tree (top 3 levels) ==="
+          ls -la
+          find . -maxdepth 3 -type d -print
 
+      # --------------------------------------------------
+      # STEP 7 — Configure Wine-TKG for Gaming
+      # This step locates customization.cfg dynamically and edits it
+      # --------------------------------------------------
       - name: Configure Wine-TKG for Gaming
         run: |
-          cd wine-tkg-git/wine-tkg-git || exit 0
+          # find customization.cfg anywhere in the clone (limit depth to keep logs readable)
+          CFG_FILE=$(find . -maxdepth 6 -type f -name customization.cfg -print -quit || true)
+          if [ -z "$CFG_FILE" ]; then
+            echo "customization.cfg not found; printing tree for debugging"
+            find . -maxdepth 6 -print
+            exit 1
+          fi
+
+          ROOT_DIR=$(dirname "$CFG_FILE")
+          echo "Found customization.cfg in: $ROOT_DIR"
+          cd "$ROOT_DIR"
 
           # FSR enable
           sed -i 's/_proton_fsr="false"/_proton_fsr="true"/' customization.cfg || true
@@ -111,9 +157,26 @@ jobs:
           echo "=== Active customization.cfg settings ==="
           grep -E "_proton_fsr|_use_esync|_use_fsync|_dxvk_dxgi|_proton_mf_hacks" customization.cfg || true
 
-      - name: Compile Wine-TKG
+      # --------------------------------------------------
+      # STEP 8 — Compile (locate and run nonpacman-build.sh)
+      # This step finds the build script dynamically and runs it
+      # --------------------------------------------------
+      - name: Compile Wine-TKG (locate and run nonpacman-build.sh)
         run: |
-          cd wine-tkg-git/wine-tkg-git || exit 0
+          # find the nonpacman-build.sh script anywhere in the clone
+          SCRIPT_PATH=$(find . -type f -name nonpacman-build.sh -print -quit || true)
+          if [ -z "$SCRIPT_PATH" ]; then
+            echo "ERROR: nonpacman-build.sh not found in repository."
+            echo "Printing repository tree (depth 6) to help debugging:"
+            find . -maxdepth 6 -print
+            exit 1
+          fi
+
+          BUILD_DIR=$(dirname "$SCRIPT_PATH")
+          echo "Found build script at: $SCRIPT_PATH"
+          echo "Changing to build directory: $BUILD_DIR"
+          cd "$BUILD_DIR"
+
           chmod +x ./nonpacman-build.sh
 
           export PKG_CONFIG_PATH_32="$PKG_CONFIG_PATH_32"
@@ -126,10 +189,14 @@ jobs:
           find . -type f -name "wine" -o -type f -name "wine64" 2>/dev/null | head -5 || true
           find . -name "*.tar.*" 2>/dev/null | head -5 || true
 
+      # --------------------------------------------------
+      # STEP 9 — Package + Upload
+      # --------------------------------------------------
       - name: Package Wine-TKG
         run: |
           mkdir -p /tmp/wine-mahefooz
 
+          # copy possible outputs
           cp -r wine-tkg-git/wine-tkg-git/nonpacman-builds/* /tmp/wine-mahefooz/ 2>/dev/null || true
 
           find wine-tkg-git -name "wine-tkg-*" -type d -exec cp -r {} /tmp/wine-mahefooz/ \; 2>/dev/null || true
