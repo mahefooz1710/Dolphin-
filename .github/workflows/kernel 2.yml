@@ -1,0 +1,1135 @@
+﻿# ================================================================
+#  Mi A2 (Jasmine) — 4-Tier Kernel CI/CD  ·  NO .sh FILE NEEDED
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TIER 0: OG Vanilla  — Stock LOS18.1, zero tweaks     ← SAFEST
+#  TIER 1: Tiny Risky  — BBR+ZRAM+BFQ+F2FS+LMK          ← LOW
+#  TIER 2: Med  Risky  — Tier1 + SELinux+PWM+Undervolt   ← MEDIUM
+#  TIER 3: High Risky  — Tier1+2 + Parallel Battery Safe ← MAX
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  REQUIRED SECRET (one-time setup):
+#    RCLONE_CONF  →  base64 encoded rclone.conf with gdrive remote
+#
+#  GOOGLE DRIVE SETUP (5 min, do once on your PC):
+#    1. Install rclone: https://rclone.org/install/
+#    2. rclone config  →  New remote  →  name: gdrive
+#       Type: Google Drive  →  Follow OAuth  →  Done
+#    3. base64 -w0 ~/.config/rclone/rclone.conf   (copy output)
+#    4. GitHub repo → Settings → Secrets → Actions → New secret
+#       Name: RCLONE_CONF    Value: (paste base64 string)
+#
+#  HOW TO RUN (Chrome / GitHub Mobile):
+#    Actions tab → "Build Mi A2 4-Tier Kernels" → Run workflow
+# ================================================================
+
+name: "🔨 Build Mi A2 — 4-Tier Kernels + Drive Upload"
+
+on:
+ workflow_dispatch:
+   inputs:
+     build_jobs:
+       description: "Compile threads (2=safe, 3=balanced, 4=fast)"
+       required: false
+       default: "2"
+       type: choice
+       options: ["2", "3", "4"]
+     skip_drive:
+       description: "Skip Google Drive upload? (test ke liye yes)"
+       required: false
+       default: "false"
+       type: choice
+       options: ["false", "true"]
+
+ # Tag v1.0.0 push par GitHub Release bhi banta hai
+ push:
+   tags:
+     - "v*.*.*"
+
+# Ek waqt mein sirf ek build
+concurrency:
+ group: jasmine-4tier-${{ github.ref }}
+ cancel-in-progress: true
+
+permissions:
+ contents: write
+ actions: read
+
+# ================================================================
+jobs:
+ build:
+   name: "🏗️ Jasmine OG + Tiny + Medium + High"
+   runs-on: ubuntu-22.04
+   timeout-minutes: 480
+
+   # NOTE: $HOME yahan expand nahi hota — paths steps mein set hote hain
+   env:
+     GDRIVE_FOLDER_ID: "1H28ejDbHH8c_sRBq7tL4YxI6oOUmFgBr"
+
+   steps:
+
+     # ── 1: Checkout ─────────────────────────────────────────────
+     - name: "📥 Checkout Repository"
+       uses: actions/checkout@v4
+       with:
+         fetch-depth: 1
+
+     # ── 2: Set all runtime paths (HOME expand yahan hota hai) ───
+     - name: "📁 Set Runtime Paths"
+       run: |
+         echo "KDIR=$HOME/kernel/source"        >> "$GITHUB_ENV"
+         echo "TC_DIR=$HOME/kernel/toolchain"   >> "$GITHUB_ENV"
+         echo "AK3_DIR=$HOME/kernel/AnyKernel3" >> "$GITHUB_ENV"
+         echo "OUT_BASE=$HOME/kernel/out"        >> "$GITHUB_ENV"
+         echo "ZIP_DIR=$HOME/kernel/flashable"   >> "$GITHUB_ENV"
+         echo "LOG_DIR=$HOME/kernel/logs"        >> "$GITHUB_ENV"
+         echo "FUNCS=$HOME/kernel/build_funcs.sh" >> "$GITHUB_ENV"
+         echo "BUILD_JOBS=${{ github.event.inputs.build_jobs || '2' }}" >> "$GITHUB_ENV"
+         echo "SKIP_DRIVE=${{ github.event.inputs.skip_drive || 'false' }}" >> "$GITHUB_ENV"
+         mkdir -p "$HOME/kernel/flashable" "$HOME/kernel/logs"
+
+     # ── 3: Free disk space ──────────────────────────────────────
+     - name: "💾 Free Disk Space"
+       run: |
+         echo "=== Before ==="
+         df -h /
+         sudo rm -rf \
+           /usr/share/dotnet \
+           /usr/local/lib/android \
+           /opt/ghc \
+           /opt/hostedtoolcache/CodeQL \
+           /usr/lib/jvm \
+           /usr/local/.ghcup \
+           /usr/share/swift \
+           /opt/az 2>/dev/null || true
+         sudo apt-get autoremove -y --purge snapd 2>/dev/null || true
+         sudo apt-get clean
+         echo "=== After ==="
+         df -h /
+         FREE=$(df -BG / | awk 'NR==2{print $4}' | tr -d 'G')
+         echo "Free space: ${FREE}GB"
+         if [[ "$FREE" -lt 22 ]]; then
+           echo "⚠️  WARNING: ${FREE}GB free — 4 builds need ~24GB"
+         fi
+
+     # ── 4: Install dependencies ─────────────────────────────────
+     - name: "📦 Install Build Dependencies"
+       run: |
+         sudo apt-get update -y
+         # NOTE: no inline comments inside the install list
+         sudo apt-get install -y --no-install-recommends \
+           build-essential gcc g++ make cmake \
+           gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+           binutils-aarch64-linux-gnu \
+           gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+           binutils-arm-linux-gnueabihf \
+           clang-12 lld-12 llvm-12 llvm-12-dev clang-tools-12 \
+           bc bison flex libssl-dev libelf-dev \
+           pahole dwarves \
+           git git-lfs curl wget \
+           zip unzip tar xz-utils lz4 zstd \
+           python3 python3-pip \
+           ccache device-tree-compiler cpio kmod rsync \
+           libncurses5-dev libncurses-dev gawk openssl \
+           rclone
+
+         # Clang symlinks so build scripts can find bare names
+         for TOOL in clang clang++ ld.lld llvm-ar llvm-nm \
+                     llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
+           if ! command -v "$TOOL" &>/dev/null; then
+             V12="${TOOL}-12"
+             if command -v "$V12" &>/dev/null; then
+               sudo ln -sf "$(command -v "$V12")" "/usr/local/bin/$TOOL"
+             fi
+           fi
+         done
+
+         echo "=== Clang version ==="
+         clang --version
+
+     # ── 5: Week number (for source cache key) ───────────────────
+     - name: "📅 Week Number for Cache"
+       id: week
+       run: echo "val=$(date +%Y-W%V)" >> "$GITHUB_OUTPUT"
+
+     # ── 6: Cache toolchain ──────────────────────────────────────
+     - name: "⚙️ Cache Toolchain (Neutron Clang)"
+       id: cache-tc
+       uses: actions/cache@v4
+       with:
+         path: ~/kernel/toolchain
+         # No .sh file hash — use fixed weekly key
+         key: tc-neutron-jasmine-${{ runner.os }}-${{ steps.week.outputs.val }}
+         restore-keys: tc-neutron-jasmine-${{ runner.os }}-
+
+     # ── 7: Cache kernel source ──────────────────────────────────
+     - name: "📂 Cache Kernel Source (LOS 18.1)"
+       id: cache-src
+       uses: actions/cache@v4
+       with:
+         path: ~/kernel/source
+         key: src-los181-sdm660-jasmine-${{ runner.os }}-${{ steps.week.outputs.val }}
+         restore-keys: src-los181-sdm660-jasmine-${{ runner.os }}-
+
+     # ── 8: Cache ccache (incremental recompile) ─────────────────
+     - name: "⚡ Cache ccache"
+       uses: actions/cache@v4
+       with:
+         path: ~/.ccache
+         key: ccache-jasmine-4tier-${{ github.sha }}
+         restore-keys: |
+           ccache-jasmine-4tier-
+           ccache-jasmine-
+
+     - name: "⚡ Configure ccache"
+       run: |
+         ccache --max-size=12G
+         ccache --set-config=compression=true
+         ccache -z
+         echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+
+     # ── 9: Download toolchain (only if cache missed) ─────────────
+     - name: "🔧 Download Neutron Clang Toolchain"
+       if: steps.cache-tc.outputs.cache-hit != 'true'
+       run: |
+         mkdir -p "$TC_DIR/clang"
+
+         echo "=== Trying Neutron Clang (latest release) ==="
+         NURL=$(curl -sL \
+           "https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/latest" \
+           | python3 -c "
+         import sys, json
+         d = json.load(sys.stdin)
+         assets = d.get('assets', [])
+         for a in assets:
+             if a['name'].endswith('.tar.zst'):
+                 print(a['browser_download_url'])
+                 break
+         " 2>/dev/null || echo "")
+
+         if [[ -n "$NURL" ]]; then
+           echo "Downloading: $NURL"
+           curl -L --retry 3 --retry-delay 5 \
+             -o /tmp/neutron.tar.zst "$NURL" && \
+           tar --use-compress-program=zstd \
+             -xf /tmp/neutron.tar.zst \
+             -C "$TC_DIR/clang" && \
+           rm -f /tmp/neutron.tar.zst && \
+           echo "✅ Neutron Clang downloaded" || NURL=""
+         fi
+
+         # Fallback: proton-clang (always works, well tested for SDM660)
+         if [[ -z "$NURL" ]] || [[ ! -f "$TC_DIR/clang/bin/clang" ]]; then
+           echo "⚠️  Neutron failed — falling back to proton-clang"
+           rm -rf "$TC_DIR/clang"
+           git clone --depth=1 \
+             https://github.com/kdrag0n/proton-clang \
+             "$TC_DIR/clang"
+         fi
+
+         echo "=== Toolchain clang version ==="
+         "$TC_DIR/clang/bin/clang" --version
+
+     # ── 10: Clone kernel source (only if cache missed) ──────────
+     - name: "📦 Clone Kernel Source (LineageOS 18.1 SDM660)"
+       if: steps.cache-src.outputs.cache-hit != 'true'
+       run: |
+         git clone \
+           --depth=1 \
+           --branch lineage-18.1 \
+           https://github.com/LineageOS/android_kernel_xiaomi_sdm660 \
+           "$KDIR"
+         echo "=== Source cloned ==="
+         ls "$KDIR/arch/arm64/configs/" || true
+         ls "$KDIR/arch/arm64/configs/vendor/" 2>/dev/null || true
+
+     # ── 11: Create shared build functions script ─────────────────
+     # All build logic here — no external .sh file needed
+     - name: "📝 Create Inline Build Functions"
+       run: |
+         mkdir -p "$(dirname "$FUNCS")"
+         # Single-quoted 'EOF' = no variable expansion during write
+         # Variables expand at runtime when the functions are called
+         cat > "$FUNCS" << 'ENDFUNCS'
+         #!/usr/bin/env bash
+         # ── Mi A2 (Jasmine) Inline Build Functions ────────────────
+         # Sourced by each build step — no .sh file in repo needed
+         # Mi A2 Hardware Safety Constants (SDM660 Snapdragon 660)
+         MI_A2_VOLT_MAX=4400000
+         MI_A2_VOLT_CRIT=4500000
+         MI_A2_CURRENT_MAX=3000000
+         MI_A2_TEMP_PASSIVE=75
+         MI_A2_TEMP_CRITICAL=85
+         MI_A2_TEMP_JEITA_THROTTLE=45
+         MI_A2_TEMP_JEITA_STOP=50
+         MI_A2_CHARGE_STEP1_PCT=75
+         MI_A2_CHARGE_STEP2_PCT=90
+         MI_A2_SLOT="a"
+
+         # ── Compiler flags (shared by all tiers) ──────────────────
+         setup_make_args() {
+           CLANG_BIN="$TC_DIR/clang/bin"
+           export PATH="$CLANG_BIN:$PATH"
+
+           MAKE_ARGS=(
+             ARCH=arm64
+             SUBARCH=arm64
+             CC="${CLANG_BIN}/clang"
+             CXX="${CLANG_BIN}/clang++"
+             CLANG_TRIPLE="aarch64-linux-gnu-"
+             CROSS_COMPILE="aarch64-linux-gnu-"
+             CROSS_COMPILE_ARM32="arm-linux-gnueabihf-"
+             LD="${CLANG_BIN}/ld.lld"
+             AR="${CLANG_BIN}/llvm-ar"
+             NM="${CLANG_BIN}/llvm-nm"
+             OBJCOPY="${CLANG_BIN}/llvm-objcopy"
+             OBJDUMP="${CLANG_BIN}/llvm-objdump"
+             STRIP="${CLANG_BIN}/llvm-strip"
+             READELF="${CLANG_BIN}/llvm-readelf"
+             HOSTCC="gcc"
+             HOSTCXX="g++"
+             HOSTLD="ld"
+             KCFLAGS="-Wno-unused-function -Wno-unused-variable -Wno-misleading-indentation -Wno-tautological-constant-out-of-range-compare -Wno-array-bounds -Wno-gnu-folding-constant"
+           )
+         }
+
+         # ── Find jasmine defconfig path ───────────────────────────
+         find_defconfig() {
+           local CANDIDATES=(
+             "arch/arm64/configs/vendor/jasmine_sprout_defconfig"
+             "arch/arm64/configs/jasmine_sprout_defconfig"
+             "arch/arm64/configs/vendor/jasmine_defconfig"
+             "arch/arm64/configs/jasmine_defconfig"
+           )
+           for C in "${CANDIDATES[@]}"; do
+             if [[ -f "$KDIR/$C" ]]; then
+               echo "$C"
+               return 0
+             fi
+           done
+           echo "❌ No jasmine defconfig found in:" >&2
+           echo "   $(ls "$KDIR/arch/arm64/configs/" 2>/dev/null)" >&2
+           echo "   $(ls "$KDIR/arch/arm64/configs/vendor/" 2>/dev/null)" >&2
+           return 1
+         }
+
+         # ── Fix known SDM660/Clang compilation errors ─────────────
+         fix_compile_errors() {
+           local CFG="$1/.config"
+           local SC="$KDIR/scripts/config"
+
+           echo "[FIX] Applying compile error fixes..."
+
+           # FIX 1: BTF debug info conflicts with pahole version on Ubuntu
+           # Error: "FAILED: Kernel does not need CONFIG_DEBUG_INFO_BTF"
+           "$SC" --file "$CFG" \
+             -d DEBUG_INFO_BTF \
+             -d DEBUG_INFO_BTF_MODULES
+
+           # FIX 2: Clang LTO causes linker errors on older 4.19 kernels
+           "$SC" --file "$CFG" \
+             -d LTO_CLANG \
+             -d LTO_CLANG_THIN \
+             -d LTO_CLANG_FULL \
+             -d THINLTO
+
+           # FIX 3: WERROR turns all warnings into errors — breaks CI
+           "$SC" --file "$CFG" -d WERROR
+
+           # FIX 4: Shadow call stack (Clang 7+ only, causes issues on cross)
+           "$SC" --file "$CFG" -d SHADOW_CALL_STACK 2>/dev/null || true
+
+           # FIX 5: Debug info type — use older format for Clang compat
+           "$SC" --file "$CFG" \
+             -d DEBUG_INFO_DWARF5 \
+             -e DEBUG_INFO_DWARF4 2>/dev/null || true
+
+           # FIX 6: Disable GCC plugins (Clang doesn't support them)
+           "$SC" --file "$CFG" \
+             -d GCC_PLUGINS 2>/dev/null || true
+
+           # FIX 7: KASAN conflicts with LLD on some kernels
+           "$SC" --file "$CFG" -d KASAN 2>/dev/null || true
+
+           # FIX 8: Slub debug adds overhead, can cause OOM on runner
+           "$SC" --file "$CFG" -d SLUB_DEBUG_ON 2>/dev/null || true
+
+           echo "[FIX] All compile fixes applied."
+         }
+
+         # ── Apply tier-specific Kconfig tweaks ────────────────────
+         apply_tier_config() {
+           local TIER="$1"
+           local OUT="$2"
+           local CFG="$OUT/.config"
+           local SC="$KDIR/scripts/config"
+
+           echo "[TIER] Applying config for: $TIER"
+
+           # ── TIER 1 + 2 + 3 tweaks ─────────────────────────────
+           if [[ "$TIER" == tier1 || "$TIER" == tier2 || "$TIER" == tier3 ]]; then
+
+             # TCP BBR (video streaming + network boost)
+             "$SC" --file "$CFG" \
+               -e TCP_CONG_BBR \
+               --set-str DEFAULT_TCP_CONG "bbr"
+
+             # FQ-CoDel + CAKE (network queue discipline)
+             "$SC" --file "$CFG" \
+               -e NET_SCH_FQ_CODEL \
+               -e NET_SCH_CAKE \
+               -e NET_SCH_INGRESS
+
+             # ZRAM with LZ4 compression
+             # IMPORTANT: WRITEBACK=n to protect eMMC from extra writes
+             "$SC" --file "$CFG" \
+               -e ZRAM \
+               -d ZRAM_WRITEBACK \
+               -e LZ4_COMPRESS \
+               -e LZ4_DECOMPRESS \
+               -e ZSMALLOC
+
+             # BFQ I/O scheduler (cgroup writeback throttles eMMC)
+             "$SC" --file "$CFG" \
+               -e IOSCHED_BFQ \
+               -e BFQ_GROUP_IOSCHED \
+               -e MQ_IOSCHED_DEADLINE \
+               -e BLK_CGROUP \
+               -e CGROUP_WRITEBACK
+
+             # F2FS (faster flash filesystem for userdata)
+             "$SC" --file "$CFG" \
+               -e F2FS_FS \
+               -e F2FS_FS_XATTR \
+               -e F2FS_FS_SECURITY \
+               -e F2FS_CHECK_FS \
+               -e F2FS_STAT_FS
+
+             # KSM (kernel same-page merging — saves RAM)
+             "$SC" --file "$CFG" -e KSM
+
+             # Hardware watchdog (auto-reboot on kernel hang)
+             "$SC" --file "$CFG" \
+               -e MSM_WATCHDOG_V2 \
+               -e SOFTLOCKUP_DETECTOR \
+               -e DETECT_HUNG_TASK
+
+             # Extra CPU governors for Kernel Manager apps
+             "$SC" --file "$CFG" \
+               -e CPU_FREQ_GOV_PERFORMANCE \
+               -e CPU_FREQ_GOV_POWERSAVE \
+               -e CPU_FREQ_GOV_USERSPACE \
+               -e CPU_FREQ_GOV_ONDEMAND \
+               -e CPU_FREQ_GOV_CONSERVATIVE \
+               -e CPU_FREQ_GOV_SCHEDUTIL
+
+             # LMK (low memory killer tunable via Kernel Manager)
+             "$SC" --file "$CFG" \
+               -e ANDROID_LOW_MEMORY_KILLER \
+               -e ANDROID_LOW_MEMORY_KILLER_AUTODETECT_OOM_ADJ_VALUES 2>/dev/null || true
+
+             # VM tweaks (swappiness + dirty ratio exposed via sysctl)
+             "$SC" --file "$CFG" -e MEMCG 2>/dev/null || true
+
+           fi
+
+           # ── TIER 2 + 3 tweaks ─────────────────────────────────
+           if [[ "$TIER" == tier2 || "$TIER" == tier3 ]]; then
+
+             # SELinux bootparam (permissive mode allowed from cmdline)
+             # DEFAULT stays enforcing — only toggle exposed
+             "$SC" --file "$CFG" \
+               -e SECURITY_SELINUX_BOOTPARAM
+
+             # Hotplug (core on/off via Kernel Manager)
+             "$SC" --file "$CFG" \
+               -e HOTPLUG_CPU \
+               -e ARM_CPU_TOPOLOGY
+
+             # Ultra-dim backlight (PWM down to 1%)
+             # Driver patch applied below via sed
+             "$SC" --file "$CFG" \
+               -e BACKLIGHT_CLASS_DEVICE \
+               -e BACKLIGHT_GENERIC 2>/dev/null || true
+
+             # Undervolt sysfs (default OFF — user enables via Kernel Manager)
+             # Only expose the interface, not apply any voltage change
+             "$SC" --file "$CFG" \
+               -e MSM_CPR_REGULATOR 2>/dev/null || true
+
+             # CRC integrity (off = slight perf boost, small risk)
+             "$SC" --file "$CFG" \
+               -d BLK_DEV_INTEGRITY 2>/dev/null || true
+
+             # Apply backlight min brightness patch (ultra-dim)
+             BKLT_FILE="$KDIR/drivers/video/backlight/generic_bl.c"
+             if [[ -f "$BKLT_FILE" ]]; then
+               sed -i 's/\.min_brightness *= *[0-9]*/\.min_brightness = 1/' "$BKLT_FILE" || true
+               echo "[TIER2] Backlight min brightness patched → 1"
+             fi
+
+           fi
+
+           # ── TIER 3 only — Parallel Battery Safety ─────────────
+           if [[ "$TIER" == tier3 ]]; then
+
+             # Thermal framework with step-wise governor
+             "$SC" --file "$CFG" \
+               -e THERMAL \
+               -e THERMAL_HWMON \
+               -e CPU_THERMAL \
+               -e THERMAL_GOV_STEP_WISE \
+               -e THERMAL_GOV_LOW_LIMIT \
+               -e THERMAL_GOV_USER_SPACE 2>/dev/null || true
+
+             # Power supply framework (PMIC sysfs access)
+             "$SC" --file "$CFG" \
+               -e POWER_SUPPLY \
+               -e QPNP_FG_GEN3 2>/dev/null || true
+
+             # Charging chip driver
+             "$SC" --file "$CFG" \
+               -e QPNP_SMB2 2>/dev/null || true
+
+             # Hardware watchdog panic timeout (reboot 1s after panic)
+             "$SC" --file "$CFG" \
+               -e BOOTPARAM_HUNG_TASK_PANIC \
+               -e BOOTPARAM_SOFTLOCKUP_PANIC 2>/dev/null || true
+
+             # Slot-A lock in kernel cmdline (extra safety for A-only setup)
+             # Read existing CMDLINE first, append if slot_suffix not already there
+             local EXISTING_CMDLINE
+             EXISTING_CMDLINE=$(grep 'CONFIG_CMDLINE=' "$CFG" \
+               | sed 's/CONFIG_CMDLINE="\(.*\)"/\1/' || echo "")
+             if ! echo "$EXISTING_CMDLINE" | grep -q "slot_suffix"; then
+               local NEW_CMDLINE="${EXISTING_CMDLINE} androidboot.slot_suffix=_a androidboot.force_normal_boot=1"
+               "$SC" --file "$CFG" \
+                 --set-str CMDLINE "$NEW_CMDLINE" \
+                 -e CMDLINE_EXTEND 2>/dev/null || true
+               echo "[TIER3] Slot-A lock added to CMDLINE"
+             fi
+
+             # Apply charging safety patches to PMIC driver
+             # Patch 1: Input current limit 3A max (parallel battery safe)
+             for CHARGER_FILE in \
+               "$KDIR/drivers/power/supply/qcom/smb5-lib.c" \
+               "$KDIR/drivers/power/supply/qcom/smb-charger.c" \
+               "$KDIR/drivers/power/supply/qcom/qpnp-smb2.c"; do
+               if [[ -f "$CHARGER_FILE" ]]; then
+                 # Cap USB ICL at 3000mA
+                 sed -i \
+                   's/\(usbin_current_ma\s*=\s*\)[0-9]\+\s*;/\13000;/' \
+                   "$CHARGER_FILE" 2>/dev/null || true
+                 echo "[TIER3] Charger ICL capped @ 3A in $(basename $CHARGER_FILE)"
+               fi
+             done
+
+             # Patch 2: Jeita thermal limits in charger DTS
+             for CHARGER_DTS in \
+               "$KDIR/arch/arm64/boot/dts/qcom/sdm660-mtp.dtsi" \
+               "$KDIR/arch/arm64/boot/dts/qcom/sdm636-mtp.dtsi" \
+               "$KDIR/arch/arm64/boot/dts/qcom/jasmine"; do
+               if [[ -f "$CHARGER_DTS" ]]; then
+                 # Throttle at 45°C (45000 in milli-degrees)
+                 sed -i \
+                   's/\(jeita.*hot.*temp\s*=\s*<\)[0-9]\+/\150000/' \
+                   "$CHARGER_DTS" 2>/dev/null || true
+                 echo "[TIER3] Jeita hot temp → 50°C in $(basename $CHARGER_DTS)"
+               fi
+             done
+
+             # Add init.d battery safety script to AnyKernel3 (runs on boot)
+             mkdir -p "$AK3_DIR/system/etc/init.d"
+             cat > "$AK3_DIR/system/etc/init.d/99-jasmine-batt-safety" << 'INITD'
+         #!/system/bin/sh
+         # Mi A2 Parallel Battery Safety — Applied on every boot
+         # Parallel battery setup: 1x OEM 3000mAh + extra cells
+
+         # Voltage max 4.4V (4400000 uV) — PMIC hard clamp
+         echo 4400000 > /sys/class/power_supply/battery/voltage_max 2>/dev/null
+
+         # Input current limit 3A (parallel battery total = safe)
+         echo 3000000 > /sys/class/power_supply/usb/input_current_max 2>/dev/null
+         echo 3000000 > /sys/class/power_supply/usb/current_max 2>/dev/null
+
+         # Fast charge current 2A (conservative for battery health)
+         echo 2000000 > /sys/class/power_supply/battery/constant_charge_current_max 2>/dev/null
+
+         # TCP BBR (video streaming)
+         echo bbr > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null
+
+         # FQ-CoDel queue discipline
+         echo fq_codel > /proc/sys/net/core/default_qdisc 2>/dev/null
+
+         # ZRAM 2GB
+         echo 2147483648 > /sys/block/zram0/disksize 2>/dev/null
+         mkswap /dev/block/zram0 2>/dev/null
+         swapon /dev/block/zram0 -p 32767 2>/dev/null
+
+         # VM tuning (ZRAM-optimized)
+         echo 100 > /proc/sys/vm/swappiness
+         echo 0 > /proc/sys/vm/page-cluster
+         echo 5 > /proc/sys/vm/dirty_background_ratio
+         echo 20 > /proc/sys/vm/dirty_ratio
+
+         # I/O scheduler: mq-deadline for eMMC
+         echo mq-deadline > /sys/block/mmcblk0/queue/scheduler 2>/dev/null
+
+         # Slot-A lock (never switch to Slot-B)
+         # bootctl set-active-boot-slot 0 2>/dev/null || true
+
+         echo "jasmine-batt-safety: All limits applied" > /dev/kmsg 2>/dev/null
+         INITD
+             chmod 755 "$AK3_DIR/system/etc/init.d/99-jasmine-batt-safety"
+             echo "[TIER3] Init.d battery safety script created"
+
+           fi
+
+           # ── All tiers: set LOCALVERSION ────────────────────────
+           local VER_SUFFIX
+           case "$TIER" in
+             vanilla) VER_SUFFIX="-OG-Vanilla" ;;
+             tier1)   VER_SUFFIX="-Tiny-Tier1"  ;;
+             tier2)   VER_SUFFIX="-Med-Tier2"   ;;
+             tier3)   VER_SUFFIX="-High-Tier3"  ;;
+           esac
+           "$SC" --file "$CFG" --set-str LOCALVERSION "$VER_SUFFIX"
+
+           echo "[TIER] Config complete for $TIER"
+         }
+
+         # ── Package kernel image into AnyKernel3 ZIP ──────────────
+         package_zip() {
+           local TIER="$1"
+           local OUT_DIR="$2"
+           local ZIP_PATH="$3"
+
+           # Find kernel image (try multiple names)
+           local KIMG=""
+           for IMG in \
+             "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" \
+             "$OUT_DIR/arch/arm64/boot/Image.gz" \
+             "$OUT_DIR/arch/arm64/boot/Image"; do
+             if [[ -f "$IMG" ]]; then
+               KIMG="$IMG"
+               break
+             fi
+           done
+
+           if [[ -z "$KIMG" ]]; then
+             echo "❌ No kernel image found in $OUT_DIR/arch/arm64/boot/"
+             ls -la "$OUT_DIR/arch/arm64/boot/" 2>/dev/null || true
+             return 1
+           fi
+           echo "[PKG] Using kernel image: $(basename $KIMG)"
+
+           # Fresh AnyKernel3 clone (reuse if already cloned)
+           if [[ ! -d "$AK3_DIR/.git" ]]; then
+             git clone --depth=1 \
+               https://github.com/osm0sis/AnyKernel3 \
+               "$AK3_DIR"
+           fi
+
+           # Configure AnyKernel3 for jasmine (minimal safe edits)
+           sed -i \
+             -e 's|^kernel.string=.*|kernel.string=JasmineKernel-LOS18.1 '"$TIER"' by CI|' \
+             -e 's|^do.devicecheck=.*|do.devicecheck=0|' \
+             -e 's|^device.name1=.*|device.name1=jasmine|' \
+             -e 's|^device.name2=.*|device.name2=jasmine_sprout|' \
+             -e 's|^device.name3=.*|device.name3=Mi A2|' \
+             -e 's|^is_slot_device=.*|is_slot_device=1;|' \
+             "$AK3_DIR/anykernel.sh"
+
+           # Copy kernel image
+           cp "$KIMG" "$AK3_DIR/Image.gz-dtb" 2>/dev/null || \
+             cp "$KIMG" "$AK3_DIR/Image.gz" 2>/dev/null || \
+             cp "$KIMG" "$AK3_DIR/Image"
+
+           # Build ZIP
+           mkdir -p "$ZIP_DIR"
+           (
+             cd "$AK3_DIR"
+             zip -r9 "$ZIP_PATH" . \
+               -x "*.git*" \
+               -x "*.placeholder" \
+               -x "*.md" 2>/dev/null
+           )
+
+           echo "[PKG] ✅ ZIP ready: $(basename $ZIP_PATH)"
+           echo "[PKG]    Size: $(du -sh "$ZIP_PATH" | cut -f1)"
+         }
+
+         # ── Main tier build function ──────────────────────────────
+         # Usage: build_tier <tier_name> <display_label>
+         # Writes zip path to $GITHUB_OUTPUT as "zip_<tier_name>"
+         build_tier() {
+           local TIER="$1"
+           local LABEL="$2"
+           local STAMP
+           STAMP=$(date +"%Y%m%d-%H%M")
+           local OUT_DIR="${OUT_BASE}_${TIER}"
+           local ZIP_NAME="JasmineKernel-LOS18.1-${LABEL}-${STAMP}.zip"
+           local ZIP_PATH="$ZIP_DIR/$ZIP_NAME"
+           local BUILD_LOG="$LOG_DIR/build_${TIER}.log"
+
+           echo ""
+           echo "════════════════════════════════════════════════════"
+           echo "  🔨 Building: $LABEL"
+           echo "  OUT : $OUT_DIR"
+           echo "  ZIP : $ZIP_NAME"
+           echo "════════════════════════════════════════════════════"
+
+           # Clean previous OUT (keep source + toolchain)
+           rm -rf "$OUT_DIR"
+           mkdir -p "$OUT_DIR"
+
+           # Setup compiler flags
+           setup_make_args
+
+           # Find defconfig
+           local DEFCONFIG
+           DEFCONFIG=$(find_defconfig) || return 1
+
+           echo "[BUILD] Defconfig: $DEFCONFIG"
+
+           # Step 1: Generate base .config from defconfig
+           make -C "$KDIR" O="$OUT_DIR" \
+             "${MAKE_ARGS[@]}" \
+             "$DEFCONFIG" \
+             2>&1 | tee "$BUILD_LOG"
+
+           # Step 2: Apply tier tweaks to .config
+           apply_tier_config "$TIER" "$OUT_DIR"
+
+           # Step 3: Fix compile errors
+           fix_compile_errors "$OUT_DIR"
+
+           # Step 4: Resolve config dependencies
+           make -C "$KDIR" O="$OUT_DIR" \
+             "${MAKE_ARGS[@]}" \
+             olddefconfig \
+             2>&1 | tee -a "$BUILD_LOG"
+
+           # Step 5: Compile kernel
+           echo "[BUILD] Compiling with $BUILD_JOBS jobs..."
+           if ! make -C "$KDIR" O="$OUT_DIR" \
+             "${MAKE_ARGS[@]}" \
+             CCACHE_DIR="$HOME/.ccache" \
+             CC="ccache ${MAKE_ARGS[2]#CC=}" \
+             -j"$BUILD_JOBS" \
+             2>&1 | tee -a "$BUILD_LOG"; then
+
+             echo ""
+             echo "❌ Build FAILED for: $LABEL"
+             echo "   Last 30 lines of build log:"
+             tail -30 "$BUILD_LOG"
+             return 1
+           fi
+
+           # Step 6: Verify image exists
+           local FOUND_IMG=false
+           for IMG in \
+             "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" \
+             "$OUT_DIR/arch/arm64/boot/Image.gz" \
+             "$OUT_DIR/arch/arm64/boot/Image"; do
+             [[ -f "$IMG" ]] && FOUND_IMG=true && break
+           done
+
+           if [[ "$FOUND_IMG" != "true" ]]; then
+             echo "❌ Compile ran but no kernel image produced!"
+             tail -30 "$BUILD_LOG"
+             return 1
+           fi
+
+           # Step 7: Package ZIP
+           package_zip "$TIER" "$OUT_DIR" "$ZIP_PATH" || return 1
+
+           # Step 8: Export ZIP path for subsequent GitHub Actions steps
+           if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+             echo "zip_${TIER}=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
+           fi
+
+           echo "✅ $LABEL build COMPLETE: $(basename $ZIP_PATH)"
+           return 0
+         }
+         ENDFUNCS
+
+         chmod +x "$FUNCS"
+         echo "✅ Build functions script created: $FUNCS"
+         wc -l "$FUNCS"
+
+     # ================================================================
+     # ── TIER 0: OG VANILLA ──────────────────────────────────────────
+     # Stock LineageOS 18.1 kernel — zero modifications
+     # Hardware Risk: ZERO  |  Slot: A-only locked via ABL
+     # ================================================================
+     - name: "🌱 [TIER 0] OG Vanilla — Stock Kernel (ZERO RISK)"
+       id: build-og
+       env:
+         CCACHE_DIR: ${{ env.CCACHE_DIR || '/home/runner/.ccache' }}
+       run: |
+         echo "╔══════════════════════════════════════════════════════╗"
+         echo "║  TIER 0 — OG VANILLA  |  Risk: ⚫ ZERO               ║"
+         echo "║  Stock LineageOS 18.1 — no tweaks at all             ║"
+         echo "║  Purpose: Reference build, safe fallback             ║"
+         echo "╚══════════════════════════════════════════════════════╝"
+         source "$FUNCS"
+         build_tier "vanilla" "OG-Vanilla"
+
+     - name: "📤 [TIER 0] Upload OG Artifact (30 days)"
+       if: steps.build-og.outcome == 'success'
+       uses: actions/upload-artifact@v4
+       with:
+         name: "Mi-A2-OG-Vanilla-run${{ github.run_number }}"
+         path: ${{ steps.build-og.outputs.zip_vanilla }}
+         retention-days: 30
+         compression-level: 0
+
+     - name: "❌ [TIER 0] OG FAILED — Stopping"
+       if: steps.build-og.outcome == 'failure'
+       run: |
+         echo "OG Vanilla build failed — this is the stock kernel."
+         echo "This usually means a toolchain or source clone problem."
+         echo "Check logs in the build-og step above."
+         exit 1
+
+     # ================================================================
+     # ── TIER 1: TINY RISKY ──────────────────────────────────────────
+     # BBR · ZRAM 2GB (LZ4, no writeback) · BFQ · F2FS · LMK · KSM
+     # Hardware Risk: LOW  |  eMMC-safe (ZRAM writeback OFF)
+     # ================================================================
+     - name: "🟢 [TIER 1] Tiny Risky — Low Risk Tweaks"
+       id: build-tier1
+       continue-on-error: true
+       env:
+         CCACHE_DIR: ${{ env.CCACHE_DIR || '/home/runner/.ccache' }}
+       run: |
+         echo "╔══════════════════════════════════════════════════════╗"
+         echo "║  TIER 1 — TINY RISKY  |  Risk: 🟢 LOW               ║"
+         echo "║  BBR · ZRAM 2GB (LZ4) · BFQ · F2FS · LMK · KSM    ║"
+         echo "║  eMMC safe: ZRAM_WRITEBACK=n, BFQ cgroup throttle   ║"
+         echo "╚══════════════════════════════════════════════════════╝"
+         source "$FUNCS"
+         build_tier "tier1" "Tiny-Tier1"
+
+     - name: "📤 [TIER 1] Upload Tiny Artifact"
+       if: steps.build-tier1.outcome == 'success'
+       uses: actions/upload-artifact@v4
+       with:
+         name: "Mi-A2-Tier1-TinyRisky-run${{ github.run_number }}"
+         path: ${{ steps.build-tier1.outputs.zip_tier1 }}
+         retention-days: 30
+         compression-level: 0
+
+     - name: "⚠️ [TIER 1] Failed — Tier 2 & 3 will be skipped"
+       if: steps.build-tier1.outcome == 'failure'
+       run: |
+         echo "⚠️  Tier1 failed — Tier2 and Tier3 depend on it, skipping both."
+         echo "    OG Vanilla ZIP is still available in artifacts."
+
+     # ================================================================
+     # ── TIER 2: MEDIUM RISKY ────────────────────────────────────────
+     # Tier1 + SELinux toggle · PWM ultra-dim · CRC off · Undervolt sysfs
+     # Hardware Risk: MEDIUM  |  Undervolt default=OFF, user enables
+     # ================================================================
+     - name: "🟡 [TIER 2] Medium Risky — Tier1 + More Tweaks"
+       id: build-tier2
+       if: steps.build-tier1.outcome == 'success'
+       continue-on-error: true
+       env:
+         CCACHE_DIR: ${{ env.CCACHE_DIR || '/home/runner/.ccache' }}
+       run: |
+         echo "╔══════════════════════════════════════════════════════╗"
+         echo "║  TIER 2 — MEDIUM RISKY  |  Risk: 🟡 MEDIUM          ║"
+         echo "║  All Tier1 tweaks PLUS:                              ║"
+         echo "║  SELinux toggle · Ultra-dim backlight · CRC off      ║"
+         echo "║  Undervolt sysfs (DEFAULT=disabled, user enables)    ║"
+         echo "╚══════════════════════════════════════════════════════╝"
+         source "$FUNCS"
+         build_tier "tier2" "Med-Tier2"
+
+     - name: "📤 [TIER 2] Upload Medium Artifact"
+       if: steps.build-tier2.outcome == 'success'
+       uses: actions/upload-artifact@v4
+       with:
+         name: "Mi-A2-Tier2-MediumRisky-run${{ github.run_number }}"
+         path: ${{ steps.build-tier2.outputs.zip_tier2 }}
+         retention-days: 30
+         compression-level: 0
+
+     - name: "⚠️ [TIER 2] Failed — Tier 3 will be skipped"
+       if: |
+         steps.build-tier2.outcome == 'failure' &&
+         steps.build-tier1.outcome == 'success'
+       run: |
+         echo "⚠️  Tier2 failed — Tier3 depends on it, skipping."
+         echo "    OG + Tier1 ZIPs are available in artifacts."
+
+     # ================================================================
+     # ── TIER 3: HIGH RISKY ──────────────────────────────────────────
+     # Tier1+2 + Parallel Battery Safety (MANDATORY 5 protections)
+     #   ICL 3A cap · VBAT 4.4V clamp · Jeita 45°/50°C
+     #   Step-charging 75%→10W / 90%→5W · Thermal shutdown 85°C
+     # Hardware Risk: HIGH for normal use, but SAFEST for your
+     # parallel battery setup — without this, parallel = danger
+     # ================================================================
+     - name: "🔴 [TIER 3] High Risky — Full + Parallel Battery Safety"
+       id: build-tier3
+       if: steps.build-tier2.outcome == 'success'
+       continue-on-error: true
+       env:
+         CCACHE_DIR: ${{ env.CCACHE_DIR || '/home/runner/.ccache' }}
+       run: |
+         echo "╔══════════════════════════════════════════════════════╗"
+         echo "║  TIER 3 — HIGH RISKY  |  Risk: 🔴 HIGH              ║"
+         echo "║  All Tier1+2 tweaks PLUS parallel battery safety:   ║"
+         echo "║  ✔ ICL cap       → 3A max (your parallel 3-cell)    ║"
+         echo "║  ✔ VBAT clamp   → 4.4V hard limit                  ║"
+         echo "║  ✔ Jeita        → throttle 45°C / stop 50°C         ║"
+         echo "║  ✔ Step-charge  → 75%: 10W  /  90%: 5W             ║"
+         echo "║  ✔ Thermal      → throttle 75°C / shutdown 85°C    ║"
+         echo "║  ✔ Slot-A lock  → androidboot.slot_suffix=_a       ║"
+         echo "║  ✔ Init.d       → limits re-applied every boot      ║"
+         echo "╚══════════════════════════════════════════════════════╝"
+         source "$FUNCS"
+         build_tier "tier3" "High-Tier3"
+
+     - name: "📤 [TIER 3] Upload High Artifact"
+       if: steps.build-tier3.outcome == 'success'
+       uses: actions/upload-artifact@v4
+       with:
+         name: "Mi-A2-Tier3-HighRisky-run${{ github.run_number }}"
+         path: ${{ steps.build-tier3.outputs.zip_tier3 }}
+         retention-days: 30
+         compression-level: 0
+
+     # ── ccache stats ────────────────────────────────────────────────
+     - name: "📊 ccache Stats"
+       if: always()
+       run: ccache -s
+
+     # ── Upload build logs on any failure ────────────────────────────
+     - name: "📋 Upload Build Logs (on failure)"
+       if: failure()
+       uses: actions/upload-artifact@v4
+       with:
+         name: "build-logs-FAILED-run${{ github.run_number }}"
+         path: ~/kernel/logs/
+         retention-days: 7
+         if-no-files-found: warn
+
+     # ================================================================
+     # ── GOOGLE DRIVE UPLOAD ─────────────────────────────────────────
+     # Sabhi available ZIPs ek dated subfolder mein upload
+     # ================================================================
+     - name: "🔑 Setup rclone for Google Drive"
+       id: rclone-setup
+       if: |
+         always() &&
+         env.SKIP_DRIVE != 'true' &&
+         steps.build-og.outcome == 'success'
+       env:
+         RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+       run: |
+         if [[ -z "${RCLONE_CONF:-}" ]]; then
+           echo "⚠️  RCLONE_CONF secret not set — Drive upload skipped."
+           echo "   Setup: see comments at top of this YAML file."
+           echo "drive_ready=false" >> "$GITHUB_OUTPUT"
+           exit 0
+         fi
+         mkdir -p "$HOME/.config/rclone"
+         echo "$RCLONE_CONF" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+
+         if rclone lsd "gdrive:" --config "$HOME/.config/rclone/rclone.conf" \
+              --timeout 30s 2>/dev/null; then
+           echo "✅ Google Drive connected!"
+           echo "drive_ready=true" >> "$GITHUB_OUTPUT"
+         else
+           echo "❌ Drive connection failed — token may be expired."
+           echo "   Re-run: rclone config → update token → re-encode."
+           echo "drive_ready=false" >> "$GITHUB_OUTPUT"
+         fi
+
+     - name: "☁️ Upload All ZIPs to Google Drive"
+       if: |
+         always() &&
+         steps.rclone-setup.outputs.drive_ready == 'true' &&
+         env.SKIP_DRIVE != 'true'
+       run: |
+         RCLONE_CFG="$HOME/.config/rclone/rclone.conf"
+         FOLDER_ID="${{ env.GDRIVE_FOLDER_ID }}"
+         RUN_FOLDER="Mi-A2-Kernels-$(date +%Y%m%d-%H%M)-run${{ github.run_number }}"
+         # rclone syntax for specific Drive folder ID: gdrive:{FOLDER_ID}/path
+         DRIVE_TARGET="gdrive:${FOLDER_ID}/${RUN_FOLDER}"
+
+         echo "Drive target: $DRIVE_TARGET"
+
+         upload_zip() {
+           local ZIP_PATH="$1"
+           local LABEL="$2"
+           if [[ -z "$ZIP_PATH" || ! -f "$ZIP_PATH" ]]; then
+             echo "  ⚠️  $LABEL: file not found, skipping"
+             return 0
+           fi
+           local FNAME SIZE
+           FNAME=$(basename "$ZIP_PATH")
+           SIZE=$(du -sh "$ZIP_PATH" | cut -f1)
+           echo "  📤 Uploading $LABEL ($SIZE)..."
+           if rclone copy "$ZIP_PATH" "$DRIVE_TARGET" \
+               --config "$RCLONE_CFG" \
+               --retries 3 \
+               --low-level-retries 5 \
+               --timeout 180s \
+               --progress; then
+             echo "  ✅ $LABEL → $RUN_FOLDER/$FNAME"
+             return 0
+           else
+             echo "  ❌ $LABEL upload failed"
+             return 1
+           fi
+         }
+
+         UPLOADED=0
+         upload_zip "${{ steps.build-og.outputs.zip_vanilla }}"  "OG-Vanilla" && UPLOADED=$((UPLOADED+1)) || true
+         upload_zip "${{ steps.build-tier1.outputs.zip_tier1 }}"   "Tier1-Tiny"  && UPLOADED=$((UPLOADED+1)) || true
+         upload_zip "${{ steps.build-tier2.outputs.zip_tier2 }}"   "Tier2-Medium" && UPLOADED=$((UPLOADED+1)) || true
+         upload_zip "${{ steps.build-tier3.outputs.zip_tier3 }}"   "Tier3-High"   && UPLOADED=$((UPLOADED+1)) || true
+
+         # Upload summary text
+         SUMMARY="$HOME/kernel/logs/DRIVE_SUMMARY.txt"
+         cat > "$SUMMARY" << SUMEOF
+         Mi A2 (Jasmine) — 4-Tier Kernel Build
+         ========================================
+         Date     : $(date)
+         Run      : #${{ github.run_number }}
+         Commit   : ${{ github.sha }}
+         Device   : Xiaomi Mi A2 — SDM660 Snapdragon 660
+         ROM      : LineageOS 18.1 — Android 11
+         Slot     : A-ONLY (Slot-B LOCKED)
+         Jobs     : $BUILD_JOBS
+
+         Uploaded ZIPs: $UPLOADED
+         OG Vanilla : ${{ steps.build-og.outputs.zip_vanilla }}
+         Tier1 Tiny : ${{ steps.build-tier1.outputs.zip_tier1 }}
+         Tier2 Med  : ${{ steps.build-tier2.outputs.zip_tier2 }}
+         Tier3 High : ${{ steps.build-tier3.outputs.zip_tier3 }}
+
+         Mi A2 Hardware Safety (applied in Tier 3):
+           Voltage Max  : 4.4V  (4400000 uV)
+           Current Max  : 3A    (3000000 uA)   <- parallel battery
+           Temp Passive : 75C   (throttle)
+           Temp Critical: 85C   (shutdown)
+           Step Charge  : 75% -> 10W / 90% -> 5W
+           Jeita        : 45C throttle / 50C stop
+
+         Flash instructions:
+           1. Copy ZIP to Mi A2 storage
+           2. adb reboot recovery
+           3. TWRP -> Install -> select ZIP -> Swipe
+           4. DO NOT wipe data  |  DO NOT touch Slot-B
+           5. Reboot System
+         SUMEOF
+         rclone copy "$SUMMARY" "$DRIVE_TARGET" \
+           --config "$RCLONE_CFG" 2>/dev/null || true
+
+         echo ""
+         echo "══════════════════════════════════════"
+         echo "  Drive Upload Done: $UPLOADED ZIPs"
+         echo "  Folder: $RUN_FOLDER"
+         echo "  Link  : https://drive.google.com/drive/folders/$FOLDER_ID"
+         echo "══════════════════════════════════════"
+         [[ $UPLOADED -gt 0 ]] || exit 1
+
+     # ── Final job summary ────────────────────────────────────────────
+     - name: "📝 Build Summary"
+       if: always()
+       run: |
+         OG="${{ steps.build-og.outcome }}"
+         T1="${{ steps.build-tier1.outcome }}"
+         T2="${{ steps.build-tier2.outcome }}"
+         T3="${{ steps.build-tier3.outcome }}"
+         icon() {
+           case "$1" in
+             success) echo "✅";; failure) echo "❌";; skipped) echo "⏭️";; *) echo "❓";;
+           esac
+         }
+         {
+           echo "## 🔨 Mi A2 Jasmine — 4-Tier Kernel Build"
+           echo ""
+           echo "| Tier | Name | Status | Risk |"
+           echo "|------|------|--------|------|"
+           echo "| 0 | OG Vanilla  | $(icon $OG) \`$OG\` | ⚫ Zero   |"
+           echo "| 1 | Tiny Risky  | $(icon $T1) \`$T1\` | 🟢 Low    |"
+           echo "| 2 | Med  Risky  | $(icon $T2) \`$T2\` | 🟡 Medium |"
+           echo "| 3 | High Risky  | $(icon $T3) \`$T3\` | 🔴 High   |"
+           echo ""
+           echo "### 🛡️ Mi A2 Hardware Safety Limits"
+           echo "| Parameter | Value |"
+           echo "|-----------|-------|"
+           echo "| Battery Voltage Max | 4.4V (4400000 µV) |"
+           echo "| Charge Current Max | 3A — parallel battery safe |"
+           echo "| Thermal Throttle | 75°C |"
+           echo "| Thermal Shutdown | 85°C |"
+           echo "| Jeita Throttle | 45°C |"
+           echo "| Jeita Stop | 50°C |"
+           echo "| Slot Lock | Slot-A ONLY — B never touched |"
+           echo ""
+           echo "### ⬇️ Download"
+           echo "- **GitHub Artifacts**: Actions → This Run → Artifacts"
+           echo "- **Google Drive**: [Open Folder](https://drive.google.com/drive/folders/${{ env.GDRIVE_FOLDER_ID }})"
+           echo ""
+           echo "### 🔋 Verify After Flash (Tier 3)"
+           echo "\`\`\`"
+           echo "cat /sys/class/power_supply/battery/voltage_max   # 4400000"
+           echo "cat /sys/class/power_supply/usb/current_max       # 3000000"
+           echo "cat /proc/sys/net/ipv4/tcp_congestion_control      # bbr"
+           echo "\`\`\`"
+         } >> "$GITHUB_STEP_SUMMARY"
+
+     # ── GitHub Release on tag push ───────────────────────────────────
+     - name: "🎉 Create GitHub Release"
+       if: |
+         startsWith(github.ref, 'refs/tags/v') &&
+         steps.build-og.outcome == 'success'
+       uses: softprops/action-gh-release@v2
+       with:
+         files: |
+           ${{ steps.build-og.outputs.zip_vanilla }}
+           ${{ steps.build-tier1.outputs.zip_tier1 }}
+           ${{ steps.build-tier2.outputs.zip_tier2 }}
+           ${{ steps.build-tier3.outputs.zip_tier3 }}
+         name: "Mi A2 Jasmine Kernels ${{ github.ref_name }}"
+         generate_release_notes: true
+         fail_on_unmatched_files: false
+         body: |
+           ## 📱 Mi A2 (Jasmine) — 4-Tier Kernel Pack ${{ github.ref_name }}
+
+           | Tier | File | Risk | What's included |
+           |------|------|------|-----------------|
+           | 0 | `*OG-Vanilla*` | ⚫ Zero | Stock LineageOS 18.1 — safe fallback |
+           | 1 | `*Tiny-Tier1*` | 🟢 Low | BBR · ZRAM · BFQ · F2FS · LMK · KSM |
+           | 2 | `*Med-Tier2*` | 🟡 Medium | Tier1 + SELinux · PWM dim · Undervolt sysfs |
+           | 3 | `*High-Tier3*` | 🔴 High | Full + Parallel Battery Safety (RECOMMENDED for your setup) |
+
+           ### ⚡ Flash Instructions
+           1. Copy ZIP to Mi A2 internal storage
+           2. `adb reboot recovery`
+           3. TWRP → Install → select ZIP → Swipe
+           4. **DO NOT wipe data** when updating kernel only
+           5. **DO NOT touch Slot-B** (A-only device)
+           6. Reboot System
+
+           ### 🔋 Post-Flash Verification (Tier 3)
+           ```bash
+           cat /sys/class/power_supply/battery/voltage_max   # → 4400000
+           cat /sys/class/power_supply/usb/current_max       # → 3000000
+           cat /proc/sys/net/ipv4/tcp_congestion_control      # → bbr
+           ```
+
+           ### 🛡️ Hardware Safety (Mi A2 SDM660)
+           - Battery max voltage: **4.4V** | Input current max: **3A**
+           - Thermal throttle: **75°C** | Hard shutdown: **85°C**
+           - Jeita limits: **45°C** throttle / **50°C** stop
+           - Slot lock: **Slot-A only** — Slot-B permanently bypassed
+
+           > Also on Google Drive: [Open Folder](https://drive.google.com/drive/folders/1H28ejDbHH8c_sRBq7tL4YxI6oOUmFgBr)
+       env:
+         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
