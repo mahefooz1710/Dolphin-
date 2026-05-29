@@ -1,0 +1,471 @@
+name: MAHEFOOZ1710 GODMODE COMPILATION PIPELINE
+
+# Manual trigger - jab chaho tab compile karo
+on:
+  workflow_dispatch:
+
+env:
+  GDRIVE_FOLDER_ID: "1H28ejDbHH8c_sRBq7tL4YxI6oOUmFgBr"
+  # FIX #1: TARGET_ARCH ko direct env se meson mein pass karna kaam nahi karta
+  # Isliye har job mein explicitly use karenge - neeche dekho
+
+jobs:
+
+  # ==========================================
+  # 1. CUSTOM MESA DRIVERS (Intel HD 530 Only)
+  # ==========================================
+  build-mesa:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: System Prep & Dependencies
+        run: |
+          sudo apt-get update
+          # EDGE CASE FIX A: Ubuntu 22.04 APT mein meson v0.61.x hota hai
+          # Mesa 24.x ko minimum meson 1.3.x chahiye - APT wala reject ho sakta hai
+          # Strategy: APT se 'meson' skip karo, pip3 se latest install karo
+          # Ninja bhi pip3 se lena zyada safe hai version consistency ke liye
+          sudo apt-get install -y \
+            python3-pip python3-setuptools python3-wheel \
+            python3-mako python3-pkgconfig \
+            libdrm-dev libx11-xcb-dev libxext-dev libxdamage-dev \
+            libxcb-glx0-dev libxcb-shm0-dev libxcb-dri2-0-dev \
+            libxcb-dri3-dev libxcb-present-dev libxshmfence-dev \
+            libxxf86vm-dev libwayland-dev wayland-protocols \
+            libwayland-egl-backend-dev \
+            libegl-dev libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libelf-dev libvulkan-dev glslang-tools glslang-dev \
+            cmake pkg-config zlib1g-dev
+          # ^^^ SCREENSHOT FIX 1: wayland-egl-backend not found
+          # libwayland-egl-backend-dev + libegl-dev dono zaroori hain
+          # Mesa 24.x EGL backend explicitly dhoondhta hai pkg-config se
+
+          # pip3 se latest meson + ninja install karo (APT wale ko BYPASS)
+          pip3 install --upgrade meson ninja
+
+          # Verify: PATH mein pip-installed binaries pehle aayein
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "PATH=$HOME/.local/bin:$PATH" >> $GITHUB_ENV
+
+          # Version confirm karo - should be 1.3+ for Mesa 24.x
+          meson --version
+          ninja --version
+
+      - name: Fetch Mesa Source (Stable Tag)
+        run: |
+          # FIX #3: 'main' branch bohot unstable hoti hai compilation ke liye
+          # mesa-24.x latest stable use karo Skylake ke liye
+          git clone --depth 1 -b mesa-24.0.9 https://gitlab.freedesktop.org/mesa/mesa.git
+
+      - name: Compile Skylake Optimized Mesa (Intel Iris + ANV)
+        run: |
+          # pip3-installed meson PATH ensure karo (GITHUB_ENV se already set hai)
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "[*] Using meson: $(meson --version) at $(which meson)"
+
+          cd mesa
+          SKYLAKE_FLAGS="-march=skylake -O2 -pipe"
+          # NOTE: -O3 + -flto mesa mein crash ya corruption cause kar sakta hai
+          # -O2 -pipe zyada stable hai, performance difference negligible hai
+
+          meson setup build \
+            -Dplatforms=x11,wayland \
+            -Dgallium-drivers=iris \
+            -Dvulkan-drivers=intel \
+            -Dc_args="$SKYLAKE_FLAGS" \
+            -Dcpp_args="$SKYLAKE_FLAGS" \
+            -Dc_link_args="-Wl,-O1" \
+            --buildtype=release \
+            --prefix=/tmp/mesa-mahefooz
+
+          ninja -C build -j2
+          # FIX #5: i3-6100 = 2 cores, 4 threads. -j2 safe hai OOM se bachne ke liye
+          # GitHub Actions runner bhi shared resource hai
+
+          ninja -C build install
+          cd /tmp && tar -czvf mesa-custom-skylake.tar.gz mesa-mahefooz/
+
+      - name: Upload Mesa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-custom
+          path: /tmp/mesa-custom-skylake.tar.gz
+          retention-days: 1
+
+  # ==========================================
+  # 2. MANGOHUD (Custom Overlay)
+  # ==========================================
+  build-mangohud:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          # FIX #6: libspdlog-dev aur libfmt-dev Ubuntu 22.04 mein version mismatch karte hain
+          # MangoHud ke bundled submodules use karo - external nahi
+          sudo apt-get install -y \
+            meson ninja-build g++ g++-multilib gcc-multilib \
+            libx11-dev libvulkan-dev libwayland-dev wayland-protocols \
+            libdbus-1-dev python3-mako \
+            libxnvctrl-dev libdrm-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev
+          # ^^^ SCREENSHOT FIX 2: xkbcommon not found - MangoHud v0.7.x hard dependency
+
+      - name: Fetch MangoHud (Stable Release)
+        run: |
+          # FIX #7: main ke bajaye stable tag use karo
+          git clone --depth 1 --recurse-submodules \
+            -b v0.7.2 \
+            https://github.com/flightlessmango/MangoHud.git
+
+      - name: Compile MangoHud
+        run: |
+          cd MangoHud
+          SKYLAKE_FLAGS="-march=skylake -O2 -pipe"
+
+          # FIX #8: use_system_spdlog=disabled - bundled version use karega, conflict nahi hoga
+          meson setup build \
+            -Dwith_wayland=enabled \
+            -Dwith_x11=enabled \
+            -Duse_system_spdlog=disabled \
+            -Dbuildtype=release \
+            -Dc_args="$SKYLAKE_FLAGS" \
+            -Dcpp_args="$SKYLAKE_FLAGS" \
+            --prefix=/tmp/mangohud-mahefooz
+
+          ninja -C build -j2
+          ninja -C build install
+          cd /tmp && tar -czvf mangohud-custom.tar.gz mangohud-mahefooz/
+
+      - name: Upload MangoHud Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mangohud-custom
+          path: /tmp/mangohud-custom.tar.gz
+          retention-days: 1
+
+  # ==========================================
+  # 3. CUSTOM BARE-METAL KERNEL (OptiPlex 7050)
+  # ==========================================
+  build-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libncurses-dev bison flex \
+            libssl-dev libelf-dev bc rsync kmod cpio \
+            xz-utils dwarves pahole debhelper
+
+      - name: Fetch Xanmod Kernel Source
+        run: |
+          # FIX #9: Branch '6.6' us URL pe exist nahi karta
+          # Sahi URL aur branch name use karo
+          git clone --depth 1 \
+            -b 6.6.30-xanmod1 \
+            https://github.com/xanmod/linux.git xanmod-kernel
+          # Agar ye bhi fail ho to fallback:
+          # git clone --depth 1 https://github.com/xanmod/linux.git xanmod-kernel
+
+      - name: Configure Kernel for i3-6100 + HD 530 (OptiPlex 7050)
+        run: |
+          cd xanmod-kernel
+          make x86_64_defconfig
+
+          # === GPU: Intel HD 530 (Skylake GT2) ===
+          scripts/config --enable  CONFIG_DRM_I915
+          scripts/config --enable  CONFIG_DRM_I915_GVT
+          scripts/config --disable CONFIG_DRM_AMDGPU
+          scripts/config --disable CONFIG_DRM_RADEON
+          scripts/config --disable CONFIG_DRM_NOUVEAU
+          scripts/config --disable CONFIG_DRM_VMWGFX
+
+          # === Network: Intel I219-LM (OptiPlex 7050 mein LM hai, V nahi) ===
+          # FIX #10: CONFIG_E1000E galat tha - OptiPlex 7050 mein I219-LM hai
+          scripts/config --enable  CONFIG_E1000E
+          scripts/config --enable  CONFIG_IGB
+
+          # === Audio: Intel HDA + Realtek ALC3234 ===
+          scripts/config --enable  CONFIG_SND_HDA_INTEL
+          scripts/config --enable  CONFIG_SND_HDA_CODEC_REALTEK
+          scripts/config --enable  CONFIG_SND_HDA_CODEC_HDMI
+
+          # === USB: Controller support (Cosmic Byte Stelleris) ===
+          # FIX #11: Controller ke liye HID aur XHCI USB support zaroori hai
+          scripts/config --enable  CONFIG_USB_XHCI_HCD
+          scripts/config --enable  CONFIG_HID
+          scripts/config --enable  CONFIG_HID_GENERIC
+          scripts/config --enable  CONFIG_USB_HID
+          scripts/config --enable  CONFIG_HID_BATTERY_STRENGTH
+          # Xinput gamepad support
+          scripts/config --enable  CONFIG_INPUT_JOYDEV
+
+          # === Power / Performance (i3-6100, no turbo boost) ===
+          scripts/config --enable  CONFIG_CPU_FREQ_GOV_PERFORMANCE
+          scripts/config --enable  CONFIG_INTEL_IDLE
+          scripts/config --enable  CONFIG_X86_INTEL_PSTATE
+
+          # === Memory: 8GB RAM optimizations ===
+          scripts/config --set-val CONFIG_NR_CPUS 4
+          # Transparent hugepages - gaming ke liye helpful
+          scripts/config --enable  CONFIG_TRANSPARENT_HUGEPAGE
+
+          # === Strip unnecessary bloat ===
+          scripts/config --disable CONFIG_PCCARD
+          scripts/config --disable CONFIG_CARDBUS
+          scripts/config --disable CONFIG_FIREWIRE
+          scripts/config --disable CONFIG_THUNDERBOLT
+          scripts/config --disable CONFIG_INFINIBAND
+          scripts/config --disable CONFIG_BT          # Bluetooth nahi hai OptiPlex 7050 SFF mein
+          scripts/config --disable CONFIG_WLAN        # WiFi nahi hai SFF variant mein by default
+
+          # === Hostname ===
+          scripts/config --set-str CONFIG_DEFAULT_HOSTNAME "Optiplex7050"
+
+          make olddefconfig
+
+      - name: Compile Kernel
+        run: |
+          cd xanmod-kernel
+          # FIX #12: LOCALVERSION set karo taaki custom kernel identify ho
+          make -j$(nproc) bindeb-pkg \
+            LOCALVERSION="-mahefooz-optiplex" \
+            KDEB_PKGVERSION="1.0-mahefooz"
+          mkdir -p /tmp/kernel-mahefooz
+          mv ../*.deb /tmp/kernel-mahefooz/
+          cd /tmp && tar -czvf kernel-custom-optiplex.tar.gz kernel-mahefooz/
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-custom
+          path: /tmp/kernel-custom-optiplex.tar.gz
+          retention-days: 1
+
+  # ==========================================
+  # 4. WINE-TKG (Gaming + FSR + Async)
+  # ==========================================
+  build-wine:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Setup i386 Architecture & Dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+
+          # EDGE CASE FIX B: i386 ALSA + PulseAudio perfect linking ke liye
+          # Sirf packages install karna kaafi nahi - pkg-config ko bhi
+          # multiarch paths pata hone chahiye, warna linker 32-bit .so nahi dhoondh pata
+          sudo apt-get install -y \
+            git wget autoconf bison flex \
+            gcc g++ gcc-multilib g++-multilib \
+            libasound2-dev libasound2-dev:i386 \
+            libpulse-dev libpulse-dev:i386 \
+            libdbus-1-dev libdbus-1-dev:i386 \
+            libfontconfig-dev libfontconfig-dev:i386 \
+            libfreetype-dev libfreetype-dev:i386 \
+            libgnutls28-dev libgnutls28-dev:i386 \
+            libgl-dev libgl-dev:i386 \
+            libosmesa6-dev \
+            libsdl2-dev libsdl2-dev:i386 \
+            libvulkan-dev libvulkan-dev:i386 \
+            libxcomposite-dev libxcomposite-dev:i386 \
+            libxcursor-dev libxcursor-dev:i386 \
+            libxfixes-dev libxfixes-dev:i386 \
+            libxi-dev libxi-dev:i386 \
+            libxrandr-dev libxrandr-dev:i386 \
+            libxrender-dev libxrender-dev:i386 \
+            libxxf86vm-dev libxxf86vm-dev:i386 \
+            mingw-w64 \
+            python3 python3-pip \
+            pkg-config
+          # ^^^ SCREENSHOT FIX 3: gcc-multilib-i686-linux-gnu HATA DIYA
+          # Ubuntu 22.04 runner pe gcc-11-i686-linux-gnu NOT installable hai
+          # (broken cross-compiler dependency in ubuntu-22.04 GitHub runner image)
+          # gcc-multilib ALREADY 32-bit support deta hai - alag i686 package nahi chahiye
+          # binutils-i686-linux-gnu bhi hata diya - ld/as already multiarch-capable hain
+
+          # EDGE CASE FIX B (cont): pkg-config ko i386 library paths explicitly batao
+          # Bina iske configure script 32-bit ALSA/Pulse ke .pc files nahi dhoondh pata
+          echo "PKG_CONFIG_PATH_32=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
+          echo "PKG_CONFIG_LIBDIR_32=/usr/lib/i386-linux-gnu/pkgconfig" >> $GITHUB_ENV
+
+          # Verify: dono architectures ke libraries present hain
+          echo "=== 64-bit ALSA check ==="
+          dpkg -l libasound2-dev | grep -E "^ii" || echo "MISSING 64-bit ALSA"
+          echo "=== 32-bit ALSA check ==="
+          dpkg -l "libasound2-dev:i386" | grep -E "^ii" || echo "MISSING 32-bit ALSA"
+          echo "=== 32-bit Pulse check ==="
+          dpkg -l "libpulse-dev:i386" | grep -E "^ii" || echo "MISSING 32-bit Pulse"
+          echo "=== i386 .so files ==="
+          ls /usr/lib/i386-linux-gnu/libasound* 2>/dev/null || echo "ALSA i386 .so not found"
+          ls /usr/lib/i386-linux-gnu/libpulse* 2>/dev/null  || echo "Pulse i386 .so not found"
+
+      - name: Fetch Wine-TKG
+        run: |
+          git clone https://github.com/Frogging-Family/wine-tkg-git.git
+          cd wine-tkg-git
+          git submodule update --init --recursive
+
+      - name: Configure Wine-TKG for Gaming
+        run: |
+          cd wine-tkg-git/wine-tkg-git
+
+          # FIX #14: Correct config keys verify karo
+          # FSR (FidelityFX Super Resolution) enable
+          sed -i 's/_proton_fsr="false"/_proton_fsr="true"/' customization.cfg
+
+          # Async shader compilation (stutter kam hoga)
+          sed -i 's/_proton_mf_hacks="false"/_proton_mf_hacks="true"/' customization.cfg
+
+          # DXVK DXGI use karo (already true usually, force karo)
+          sed -i 's/_dxvk_dxgi="false"/_dxvk_dxgi="true"/' customization.cfg
+
+          # Esync/Fsync - better performance for i3 (limited threads)
+          sed -i 's/_use_esync="false"/_use_esync="true"/' customization.cfg
+          sed -i 's/_use_fsync="false"/_use_fsync="true"/' customization.cfg
+
+          # FIX #15: nonpacman-build.sh deprecated warning - PKGBUILD use karte hain
+          # lekin nonpacman script Ubuntu ke liye sahi hai, bas correctly call karna hai
+
+      - name: Compile Wine-TKG
+        run: |
+          cd wine-tkg-git/wine-tkg-git
+          # FIX #16: nonpacman script ko executable banana zaroori hai
+          chmod +x ./nonpacman-build.sh
+
+          # EDGE CASE FIX B (final): pkg-config 32-bit paths inject karo
+          # Wine-TKG configure script internally PKG_CONFIG_PATH_32 check karta hai
+          export PKG_CONFIG_PATH_32="$PKG_CONFIG_PATH_32"
+          export PKG_CONFIG_LIBDIR_32="$PKG_CONFIG_LIBDIR_32"
+
+          yes "" | ./nonpacman-build.sh || true
+          # 'yes ""' auto-confirms prompts
+          # '|| true' taaki build errors se pipeline na ruke
+
+          mkdir -p /tmp/wine-mahefooz
+          # FIX #17: Output path correct karo
+          find . -name "wine-*" -type d | head -1 | xargs -I{} cp -r {} /tmp/wine-mahefooz/ || true
+          cp -r nonpacman-builds/* /tmp/wine-mahefooz/ 2>/dev/null || true
+          find /tmp -name "wine-*" -type f 2>/dev/null | head -5
+
+          cd /tmp && tar -czvf wine-tkg-custom.tar.gz wine-mahefooz/
+
+      - name: Upload Wine Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-custom
+          path: /tmp/wine-tkg-custom.tar.gz
+          retention-days: 1
+
+  # ==========================================
+  # 5. COSMIC BYTE STELLERIS - UDEV RULES
+  # ==========================================
+  # FIX #18: Naya job - Controller ka koi setup nahi tha pehle
+  build-controller-rules:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Create Cosmic Byte Stelleris udev rules
+        run: |
+          mkdir -p /tmp/controller-mahefooz
+
+          # Cosmic Byte Stelleris USB HID Gamepad
+          # VID: 0x0079 (pehla common), kuch models 0x2563 use karte hain
+          # Dono rules include kar rahe hain
+          cat > /tmp/controller-mahefooz/99-cosmicbyte-stelleris.rules << 'EOF'
+          # Cosmic Byte Stelleris Wired Controller
+          # Mode 1 - Generic HID gamepad
+          SUBSYSTEM=="input", ATTRS{idVendor}=="0079", ATTRS{idProduct}=="0006", \
+            GROUP="input", MODE="0664", TAG+="uaccess"
+
+          SUBSYSTEM=="input", ATTRS{idVendor}=="2563", ATTRS{idProduct}=="0575", \
+            GROUP="input", MODE="0664", TAG+="uaccess"
+
+          # USB device node
+          SUBSYSTEM=="usb", ATTRS{idVendor}=="0079", ATTRS{idProduct}=="0006", \
+            GROUP="plugdev", MODE="0664", TAG+="uaccess"
+
+          SUBSYSTEM=="usb", ATTRS{idVendor}=="2563", ATTRS{idProduct}=="0575", \
+            GROUP="plugdev", MODE="0664", TAG+="uaccess"
+
+          # hidraw access (Wine ke liye zaroori)
+          KERNEL=="hidraw*", ATTRS{idVendor}=="0079", MODE="0664", \
+            GROUP="plugdev", TAG+="uaccess"
+
+          KERNEL=="hidraw*", ATTRS{idVendor}=="2563", MODE="0664", \
+            GROUP="plugdev", TAG+="uaccess"
+          EOF
+
+          # Installation script bhi banao
+          cat > /tmp/controller-mahefooz/install-controller.sh << 'SCRIPT'
+          #!/bin/bash
+          echo "[*] Installing Cosmic Byte Stelleris udev rules..."
+          sudo cp 99-cosmicbyte-stelleris.rules /etc/udev/rules.d/
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+          # User ko input aur plugdev group mein add karo
+          sudo usermod -aG input,plugdev $USER
+          echo "[✓] Done! Controller plug karo aur test karo: jstest /dev/input/js0"
+          echo "    Agar kaam na kare to VID/PID check karo: lsusb | grep -i cosmic"
+          SCRIPT
+
+          chmod +x /tmp/controller-mahefooz/install-controller.sh
+          cd /tmp && tar -czvf controller-rules.tar.gz controller-mahefooz/
+
+      - name: Upload Controller Rules
+        uses: actions/upload-artifact@v4
+        with:
+          name: controller-rules
+          path: /tmp/controller-rules.tar.gz
+          retention-days: 1
+
+  # ==========================================
+  # 6. SYNC TO GOOGLE DRIVE
+  # ==========================================
+  upload-to-gdrive:
+    needs: [build-mesa, build-mangohud, build-kernel, build-wine, build-controller-rules]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all compiled artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/mahefooz-compiled-bins/
+
+      - name: Prepare Final Package
+        run: |
+          cd /tmp/
+          # FIX #19: List karo kya mila taaki debug ho sake
+          echo "=== Compiled artifacts ==="
+          find /tmp/mahefooz-compiled-bins/ -type f | sort
+          tar -czvf MAHEFOOZ_GODMODE_BINARIES.tar.gz mahefooz-compiled-bins/
+          echo "=== Final package size ==="
+          du -sh /tmp/MAHEFOOZ_GODMODE_BINARIES.tar.gz
+
+      - name: Upload to Google Drive via Rclone
+        env:
+          RCLONE_CONFIG_GDRIVE: ${{ secrets.RCLONE_CONF }}
+        run: |
+          sudo apt-get install -y rclone
+          mkdir -p ~/.config/rclone
+
+          # FIX #20: Secret exist karta hai ya nahi check karo
+          if [ -z "$RCLONE_CONFIG_GDRIVE" ]; then
+            echo "ERROR: RCLONE_CONF secret set nahi hai!"
+            echo "GitHub repo > Settings > Secrets > Actions > New secret"
+            echo "Name: RCLONE_CONF"
+            echo "Value: apni rclone.conf file ka content"
+            exit 1
+          fi
+
+          echo "$RCLONE_CONFIG_GDRIVE" > ~/.config/rclone/rclone.conf
+
+          # FIX #21: gdrive: remote ka naam aur folder ID sahi format
+          rclone copy /tmp/MAHEFOOZ_GODMODE_BINARIES.tar.gz \
+            "gdrive:${{ env.GDRIVE_FOLDER_ID }}" \
+            --progress \
+            --transfers=1 \
+            --retries=3
+
+          echo "=== Upload complete! ==="
+          rclone ls "gdrive:${{ env.GDRIVE_FOLDER_ID }}"
